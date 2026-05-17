@@ -1,0 +1,58 @@
+name: Sync with upstream
+
+on:
+  schedule:
+    - cron: '0 9 * * 1'  # Mondays 09:00 UTC
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: master
+      - name: Sync with upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM: https://github.com/paperclipai/paperclip.git
+          BRANCH: master
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM"
+          git fetch upstream "$BRANCH"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          BEHIND=$(git rev-list --count "HEAD..upstream/$BRANCH")
+          AHEAD=$(git rev-list --count "upstream/$BRANCH..HEAD")
+          echo "Behind: $BEHIND, Ahead: $AHEAD"
+          if [ "$BEHIND" = "0" ]; then
+            echo "::notice::Already up to date with upstream"
+            exit 0
+          fi
+          if git merge --ff-only "upstream/$BRANCH"; then
+            git push origin "$BRANCH"
+            echo "::notice::Fast-forwarded $BRANCH by $BEHIND commits"
+          else
+            PR_BRANCH="sync-upstream-$(date +%Y%m%d-%H%M)"
+            git checkout -b "$PR_BRANCH"
+            if git merge --no-edit "upstream/$BRANCH"; then
+              git push origin "$PR_BRANCH"
+              gh pr create \
+                --title "Sync upstream ($BEHIND commits behind)" \
+                --body "Weekly upstream sync via Action. Review the diff and merge if clean. Behind by $BEHIND, ahead by $AHEAD." \
+                --head "$PR_BRANCH" \
+                --base "$BRANCH"
+            else
+              git merge --abort
+              gh issue create \
+                --title "Upstream sync conflict ($BEHIND commits behind)" \
+                --body "Manual resolution needed. Run \`git fetch upstream && git checkout $BRANCH && git merge upstream/$BRANCH\` locally to fix conflicts. Behind $BEHIND, ahead $AHEAD."
+            fi
+          fi
