@@ -99,25 +99,33 @@ describe("buildRoutingOverrideEnv (Phase E1 dispatch wrap)", () => {
       });
     });
 
-    it("resolver-driven values override any pre-existing HERMES_*_OVERRIDE in the env", () => {
-      // If the agent record happens to carry stale HERMES_MODEL_OVERRIDE
-      // (e.g. residue from a manual verify-routing-overrides.py run),
-      // the dispatch resolver decision must win for the current call.
+    it("a persisted HERMES_*_OVERRIDE on the agent record wins over the resolver fill-in", () => {
+      // Manual operator escape hatch: if the agent record explicitly
+      // carries HERMES_MODEL_OVERRIDE (e.g. for debugging via PATCH, or
+      // an emergency pin), the resolver does not overwrite it. The
+      // resolver still records its decision via the returned
+      // `resolution` (which the dispatcher persists into
+      // heartbeat_runs.tier_chosen), so the divergence between
+      // "resolver wanted" and "adapter used" is visible.
       const existingEnv: Record<string, unknown> = {
-        HERMES_MODEL_OVERRIDE: { type: "plain", value: "stale-value" },
-        HERMES_PROVIDER_OVERRIDE: { type: "plain", value: "stale-provider" },
+        HERMES_MODEL_OVERRIDE: { type: "plain", value: "operator-pinned-model" },
+        HERMES_PROVIDER_OVERRIDE: { type: "plain", value: "operator-pinned-provider" },
       };
-      const { env } = buildRoutingOverrideEnv({
+      const { resolution, env } = buildRoutingOverrideEnv({
         issueComplexity: "hard",
         existingEnv,
       });
+      // The resolver still chose heavy/opus — visible in `resolution`.
+      expect(resolution.tier).toBe("heavy");
+      expect(resolution.entry.model).toBe("claude-opus-4-7");
+      // But the operator's pin wins in the env that the adapter sees.
       expect(env.HERMES_MODEL_OVERRIDE).toEqual({
         type: "plain",
-        value: "claude-opus-4-7",
+        value: "operator-pinned-model",
       });
       expect(env.HERMES_PROVIDER_OVERRIDE).toEqual({
         type: "plain",
-        value: "anthropic",
+        value: "operator-pinned-provider",
       });
     });
 
