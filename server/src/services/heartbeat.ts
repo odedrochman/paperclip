@@ -714,6 +714,13 @@ const heartbeatRunListColumns = {
   exitCode: heartbeatRuns.exitCode,
   signal: heartbeatRuns.signal,
   usageJson: heartbeatRuns.usageJson,
+  // Phase E1 routing fields: surface on LIST so dashboards + audit
+  // tooling can read tier_chosen / model_used / total_cost_usd /
+  // escalation_count without having to fetch each run individually.
+  tierChosen: heartbeatRuns.tierChosen,
+  modelUsed: heartbeatRuns.modelUsed,
+  totalCostUsd: heartbeatRuns.totalCostUsd,
+  escalationCount: heartbeatRuns.escalationCount,
   sessionIdBefore: heartbeatRuns.sessionIdBefore,
   sessionIdAfter: heartbeatRuns.sessionIdAfter,
   logStore: heartbeatRuns.logStore,
