@@ -7750,15 +7750,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       //   - timed-out runs are NOT escalated (timeout != tier-related)
       //   - cancelled runs are NOT escalated (operator stopped them)
       //   - tier=heavy cannot escalate further (no next tier)
+      //   - adapter failures with `errorFamily` (e.g. transient_upstream)
+      //     or `retryNotBefore` are owned by the existing bounded-retry
+      //     mechanism (which creates a new heartbeat_run with
+      //     status=scheduled_retry). Phase E2 must not pre-empt that
+      //     path — the two retry layers serve different failure modes:
+      //     bounded-retry handles transient provider noise; Phase E2
+      //     handles cases where the resolved tier itself was wrong for
+      //     the task (model unavailable, context exceeded, etc.).
       // The retry forcibly takes over the override (operator-pin
       // precedence from buildRoutingOverrideEnv is inverted here —
       // escalation is the recovery layer and operator pin is what
       // failed). All existing env keys are preserved.
       const firstCallFailed = (adapterResult.exitCode ?? 0) !== 0 || Boolean(adapterResult.errorMessage);
+      const adapterOwnsRetry =
+        Boolean(adapterResult.errorFamily) || Boolean(adapterResult.retryNotBefore);
       const escalateCandidate = resolvedRoutingTier ? escalateOneTier(resolvedRoutingTier) : null;
       if (
         firstCallFailed &&
         !adapterResult.timedOut &&
+        !adapterOwnsRetry &&
         escalationCount === 0 &&
         escalateCandidate !== null
       ) {
