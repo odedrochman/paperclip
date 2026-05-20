@@ -32,6 +32,7 @@ function createToken() {
 const CONFIG_REVISION_FIELDS = [
   "name",
   "role",
+  "tierPreference",
   "title",
   "reportsTo",
   "capabilities",
@@ -93,6 +94,7 @@ function buildConfigSnapshot(
   return {
     name: row.name,
     role: row.role,
+    tierPreference: row.tierPreference,
     title: row.title,
     reportsTo: row.reportsTo,
     capabilities: row.capabilities,

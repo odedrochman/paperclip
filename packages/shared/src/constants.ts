@@ -149,6 +149,23 @@ export const ISSUE_PRIORITIES = ["critical", "high", "medium", "low"] as const;
 export type IssuePriority = (typeof ISSUE_PRIORITIES)[number];
 export const ISSUE_WORK_MODES = ["standard", "planning"] as const;
 export type IssueWorkMode = (typeof ISSUE_WORK_MODES)[number];
+
+/**
+ * Operator-facing complexity classifier on an issue. ceo-chat parses
+ * `#trivial`/`#hard`/`#local` tags from issue titles into this field
+ * (untagged defaults to `normal`). The dispatch layer maps complexity
+ * to a routing tier (see ROUTING_TIERS) at run time.
+ */
+export const ISSUE_COMPLEXITIES = ["trivial", "normal", "hard", "local"] as const;
+export type IssueComplexity = (typeof ISSUE_COMPLEXITIES)[number];
+
+/**
+ * Concrete routing tiers used by the dispatch layer. An agent declares
+ * its default tier (agent.tier_preference); a run records which tier
+ * was actually selected (heartbeat_runs.tier_chosen).
+ */
+export const ROUTING_TIERS = ["local", "fast", "default", "heavy"] as const;
+export type RoutingTier = (typeof ROUTING_TIERS)[number];
 export const MAX_ISSUE_REQUEST_DEPTH = 1024;
 
 export const ISSUE_COMMENT_AUTHOR_TYPES = ["user", "agent", "system"] as const;
