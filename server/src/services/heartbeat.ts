@@ -14,10 +14,12 @@ import {
   type EnvironmentLeaseStatus,
   type ExecutionWorkspace,
   type ExecutionWorkspaceConfig,
+  type IssueComplexity,
   type IssueExecutionMonitorClearReason,
   type IssueExecutionMonitorPolicy,
   type IssueExecutionMonitorRecoveryPolicy,
   type ModelProfileKey,
+  type RoutingTier,
   type RunLivenessState,
 } from "@paperclipai/shared";
 import {
@@ -55,6 +57,7 @@ import type {
   UsageSummary,
 } from "../adapters/index.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
+import { buildRoutingOverrideEnv } from "../routing/build-routing-override-env.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
@@ -2433,6 +2436,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         assigneeAgentId: issues.assigneeAgentId,
         assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
         executionWorkspaceSettings: issues.executionWorkspaceSettings,
+        complexity: issues.complexity,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId)))
@@ -7095,7 +7099,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       runScopedMentionedSkillKeys,
     );
     const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(agent.companyId);
-    let runtimeConfig = {
+    let runtimeConfig: Record<string, unknown> = {
       ...effectiveResolvedConfig,
       paperclipRuntimeSkills: runtimeSkillEntries,
     };
@@ -7438,6 +7442,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let handle: RunLogHandle | null = null;
     let stdoutExcerpt = "";
     let stderrExcerpt = "";
+    // Routing layer (Phase E1): resolved per call from issue.complexity +
+    // agent.tier_preference. Hoisted out of the inner try so the failure
+    // catch can also persist what was attempted onto heartbeat_runs.
+    let resolvedRoutingTier: RoutingTier | null = null;
+    let resolvedRoutingModel: string | null = null;
     let outputSeq = Number(run.lastOutputSeq ?? 0);
     let lastOutputFlushAt: Date | null = run.lastOutputAt ?? null;
     const outputProgressState: {
@@ -7665,6 +7674,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
+
+      // Phase E1: resolve the per-call routing tier and wrap config.env so
+      // the hermes adapter's Patch 5.1 read site sees the override. We
+      // wrap runtimeConfig here (not agent.adapterConfig) because Patch
+      // 5.1 reads config.env?.HERMES_*_OVERRIDE at adapter.execute time;
+      // mutating the persisted agent record would be racy and leave
+      // residue on crashes. The existing env keys (e.g. ANTHROPIC_API_KEY
+      // and HERMES_YOLO_MODE on the pilot) are preserved by the helper.
+      const routingOverride = buildRoutingOverrideEnv({
+        issueComplexity: (issueContext?.complexity as IssueComplexity | null | undefined) ?? null,
+        agentTierPreference: (agent.tierPreference as RoutingTier | null | undefined) ?? null,
+        existingEnv: parseObject(runtimeConfig.env),
+      });
+      resolvedRoutingTier = routingOverride.resolution.tier;
+      resolvedRoutingModel = routingOverride.resolution.entry.model;
+      runtimeConfig = {
+        ...runtimeConfig,
+        env: routingOverride.env,
+      };
+
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent,
@@ -7844,6 +7873,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         adapterResult.summary ?? null,
       );
 
+      // Phase E1: persist the routing decision + the model the adapter
+      // reported using + the call cost so heartbeat_runs records what
+      // actually ran. modelUsed prefers adapterResult.model (what the
+      // adapter declared after honoring or ignoring the override) over
+      // the resolver's pick, so a silent fallback would still be
+      // visible. totalCostUsd is null on cost-less runs (e.g. local
+      // tier via ollama).
+      const adapterReportedModel = readNonEmptyString(adapterResult.model);
       let persistedRun = await setRunStatus(run.id, status, {
         finishedAt: new Date(),
         error: runErrorMessage,
@@ -7858,6 +7895,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logBytes: logSummary?.bytes,
         logSha256: logSummary?.sha256,
         logCompressed: logSummary?.compressed ?? false,
+        tierChosen: resolvedRoutingTier,
+        modelUsed: adapterReportedModel ?? resolvedRoutingModel,
+        totalCostUsd: adapterResult.costUsd ?? null,
       });
       if (persistedRun) {
         persistedRun = await classifyAndPersistRunLiveness(persistedRun, persistedResultJson) ?? persistedRun;
@@ -7998,6 +8038,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logBytes: logSummary?.bytes,
         logSha256: logSummary?.sha256,
         logCompressed: logSummary?.compressed ?? false,
+        // Phase E1: persist what was attempted even on failure so the
+        // routing decision is traceable when an adapter call throws
+        // before reporting a model.
+        tierChosen: resolvedRoutingTier,
+        modelUsed: resolvedRoutingModel,
       });
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: new Date(),
