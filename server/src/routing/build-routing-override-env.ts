@@ -17,6 +17,16 @@
  * the pilot) are preserved. The override values use the typed-env
  * wrapper shape Patch 1 + Patch 5.1 expect: `{ type: "plain", value:
  * "..." }`.
+ *
+ * Precedence: a persisted HERMES_*_OVERRIDE on the agent record wins
+ * over the resolver-computed value. This keeps the manual operator
+ * escape hatch (the PATCH-then-invoke mechanism that
+ * verify-routing-overrides.py exercises as a Patch 5.1 regression
+ * suite) working while letting the resolver fill in for the common
+ * case where no manual override is set. heartbeat_runs.tier_chosen
+ * still reflects the resolver's intent so any divergence between
+ * "tier the resolver picked" and "model the adapter actually used" is
+ * visible on the run record.
  */
 import type { IssueComplexity, RoutingTier } from "@paperclipai/shared";
 
@@ -35,10 +45,10 @@ export interface BuildRoutingOverrideEnvResult {
   /** Full resolver decision (tier, source, model menu entry). */
   readonly resolution: ResolveTierResult;
   /**
-   * New env map: existingEnv spread first, then HERMES_MODEL_OVERRIDE +
-   * HERMES_PROVIDER_OVERRIDE added. If a caller had previously set these
-   * two keys, the resolver-driven values win (the wrap is the source of
-   * truth for the call).
+   * New env map: HERMES_*_OVERRIDE entries are added FIRST, then
+   * existingEnv is spread LAST so a persisted operator override wins
+   * over the resolver fill-in. See file-level docstring for the
+   * precedence rationale.
    */
   readonly env: Record<string, unknown>;
 }
@@ -53,9 +63,9 @@ export function buildRoutingOverrideEnv(
   return {
     resolution,
     env: {
-      ...(input.existingEnv ?? {}),
       HERMES_MODEL_OVERRIDE: { type: "plain", value: resolution.entry.model },
       HERMES_PROVIDER_OVERRIDE: { type: "plain", value: resolution.entry.provider },
+      ...(input.existingEnv ?? {}),
     },
   };
 }
