@@ -39,6 +39,7 @@ import {
   environments,
   heartbeatRunEvents,
   heartbeatRuns,
+  skills,
 } from "@paperclipai/db";
 
 import {
@@ -90,6 +91,7 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(companySkills);
+    await db.delete(skills);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -110,6 +112,18 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
       `const out = {};`,
       `for (const k of keys) { if (k in process.env) out[k] = process.env[k]; }`,
       `fs.writeFileSync(${JSON.stringify(dumpPath)}, JSON.stringify(out));`,
+      `process.exit(0);`,
+    ].join(" ");
+  }
+
+  /** Worker script: copy GUILD_SKILLS_PATH out to a test-controlled
+   * path before the outer finally cleans the sandbox. Lets the test
+   * assert what the worker actually saw at start of run. */
+  function skillsSnapshotCopyScript(destPath: string) {
+    return [
+      `const fs = require('node:fs');`,
+      `const src = process.env.GUILD_SKILLS_PATH;`,
+      `if (src) fs.copyFileSync(src, ${JSON.stringify(destPath)});`,
       `process.exit(0);`,
     ].join(" ");
   }
@@ -256,5 +270,148 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
 
     const rows = await db.select({ kind: agents.kind }).from(agents).where(eq(agents.id, agentId));
     expect(rows[0]?.kind).toBe("guild");
+  }, 30_000);
+
+  it("(E1c) snapshot exposes only canonical, non-retired skills, ordered desc by createdAt, capped at 20", async () => {
+    const companyId = await setupCompany();
+    const agentId = randomUUID();
+    const snapshotCopyPath = path.join(testTmpRoot, `skills-snapshot-${agentId}.json`);
+    const bundleRoot = await fs.mkdtemp(path.join(testTmpRoot, "snapshot-bundle-"));
+    await fs.writeFile(path.join(bundleRoot, "autonomy.json"), "{}", "utf-8");
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "snapshot-guild",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      kind: "guild",
+      adapterConfig: {
+        workerAdapterType: "process",
+        instructionsRootPath: bundleRoot,
+        command: process.execPath,
+        args: ["-e", skillsSnapshotCopyScript(snapshotCopyPath)],
+      },
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    // Set up a mix that exercises the filter + ordering:
+    //   - canonical, non-retired, OLDER  -> expected at index 1
+    //   - canonical, non-retired, NEWER  -> expected at index 0 (desc by createdAt)
+    //   - provisional, non-retired       -> excluded (canonical-only)
+    //   - canonical, retired             -> excluded (includeRetired=false)
+    const now = Date.now();
+    await db.insert(skills).values([
+      {
+        guildId: agentId,
+        companyId,
+        name: "older-canonical",
+        body: "older canonical body",
+        provenance: "canonical",
+        createdAt: new Date(now - 30_000),
+        updatedAt: new Date(now - 30_000),
+      },
+      {
+        guildId: agentId,
+        companyId,
+        name: "newer-canonical",
+        body: "newer canonical body",
+        provenance: "canonical",
+        createdAt: new Date(now - 5_000),
+        updatedAt: new Date(now - 5_000),
+      },
+      {
+        guildId: agentId,
+        companyId,
+        name: "provisional-only",
+        body: "should be excluded",
+        provenance: "provisional",
+      },
+      {
+        guildId: agentId,
+        companyId,
+        name: "retired-canonical",
+        body: "should be excluded",
+        provenance: "canonical",
+        retiredAt: new Date(now - 1_000),
+      },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    const finished = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(finished?.status).toBe("succeeded");
+
+    // The worker copied GUILD_SKILLS_PATH out before the finally
+    // cleaned the sandbox. Read it now.
+    const snapshot = JSON.parse(await fs.readFile(snapshotCopyPath, "utf-8"));
+    expect(snapshot.guildId).toBe(agentId);
+    expect(snapshot.guildSlug).toBe("snapshot-guild");
+    expect(snapshot.totalCanonical).toBe(2);
+    expect(snapshot.skills).toHaveLength(2);
+    expect(snapshot.skills[0].name).toBe("newer-canonical");
+    expect(snapshot.skills[0].body).toBe("newer canonical body");
+    expect(snapshot.skills[1].name).toBe("older-canonical");
+    // Each entry has the minimal {id, name, body} shape (no provenance, no FK leak).
+    expect(Object.keys(snapshot.skills[0]).sort()).toEqual(["body", "id", "name"]);
+    // snapshotAt is a real timestamp
+    expect(() => new Date(snapshot.snapshotAt).toISOString()).not.toThrow();
+  }, 30_000);
+
+  it("(E1c) snapshot is empty when the guild has no canonical skills (worker still spawns successfully)", async () => {
+    const companyId = await setupCompany();
+    const agentId = randomUUID();
+    const snapshotCopyPath = path.join(testTmpRoot, `empty-snapshot-${agentId}.json`);
+    const bundleRoot = await fs.mkdtemp(path.join(testTmpRoot, "empty-snapshot-bundle-"));
+    await fs.writeFile(path.join(bundleRoot, "autonomy.json"), "{}", "utf-8");
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "empty-snapshot-guild",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      kind: "guild",
+      adapterConfig: {
+        workerAdapterType: "process",
+        instructionsRootPath: bundleRoot,
+        command: process.execPath,
+        args: ["-e", skillsSnapshotCopyScript(snapshotCopyPath)],
+      },
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    // ONE provisional skill (excluded) and ONE retired-canonical (excluded).
+    // Net: zero canonical non-retired skills.
+    await db.insert(skills).values([
+      {
+        guildId: agentId,
+        companyId,
+        name: "provisional-only-empty-case",
+        body: "provisional",
+        provenance: "provisional",
+      },
+      {
+        guildId: agentId,
+        companyId,
+        name: "retired-only-empty-case",
+        body: "retired canonical",
+        provenance: "canonical",
+        retiredAt: new Date(),
+      },
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    const finished = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(finished?.status).toBe("succeeded");
+
+    const snapshot = JSON.parse(await fs.readFile(snapshotCopyPath, "utf-8"));
+    expect(snapshot.totalCanonical).toBe(0);
+    expect(snapshot.skills).toEqual([]);
   }, 30_000);
 });

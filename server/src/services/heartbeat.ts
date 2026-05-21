@@ -71,6 +71,7 @@ import { costService } from "./costs.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
+import { guildSkillService } from "./guild-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService } from "./secrets.js";
 import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
@@ -7738,18 +7739,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       resolvedRoutingModel = routingOverride.resolution.entry.model;
       // Plan 3 Phase E1b: for kind='guild' runs, mkdtemp a per-run
       // sandbox now (before adapter.execute), copy in autonomy.json,
-      // and write an empty available_skills.json placeholder (E1c
-      // will populate the snapshot from the DB). Sandbox warnings
-      // are non-fatal: a missing autonomy.json or instructionsRootPath
+      // and write the canonical-skills snapshot. Sandbox warnings are
+      // non-fatal: a missing autonomy.json or instructionsRootPath
       // degrades the worker envelope but does not block the run.
+      //
+      // Phase E1c: the snapshot is the guild's top-20 canonical,
+      // non-retired skills by recency (per design spec D6). Workers
+      // see a deterministic snapshot at spawn time; operator
+      // promotions in flight do not change the worker's view
+      // mid-run. The full DB is still reachable via the
+      // `GET /api/companies/:cid/guilds/:gid/skills` route for
+      // workers that need fresh data. Snapshot-query failures are
+      // non-fatal: we log.warn and dispatch with an empty array.
       if (agent.kind === "guild") {
         const instructionsRoot = readNonEmptyString(persistedAgentAdapterConfig.instructionsRootPath);
+        let snapshotSkills: Array<{ id: string; name: string; body: string }> = [];
+        try {
+          const rows = await guildSkillService(db).list(agent.companyId, agent.id, {
+            provenance: "canonical",
+            includeRetired: false,
+            limit: 20,
+          });
+          snapshotSkills = rows.map((row) => ({ id: row.id, name: row.name, body: row.body }));
+        } catch (snapshotErr) {
+          logger.warn(
+            { err: snapshotErr, runId: run.id, agentId: agent.id },
+            "guild dispatch: canonical-skills snapshot query failed; dispatching with empty snapshot",
+          );
+        }
         const prep = await prepareGuildRunSandbox({
           runId: run.id,
           guildId: agent.id,
           guildSlug: agent.name,
           guildInstructionsRoot: instructionsRoot,
-          skills: [],
+          skills: snapshotSkills,
         });
         guildSandboxDir = prep.sandboxDir;
         for (const warning of prep.warnings) {
