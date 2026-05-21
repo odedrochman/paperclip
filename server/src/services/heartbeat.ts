@@ -61,6 +61,11 @@ import { buildRoutingOverrideEnv } from "../routing/build-routing-override-env.j
 import { buildRoutingEscalatedPayload } from "../routing/build-routing-escalated-event.js";
 import { escalateOneTier } from "../routing/escalate-tier.js";
 import { resolveModel } from "../routing/model-menu.js";
+import { buildGuildWorkerEnv } from "../dispatch/guild-worker-env.js";
+import {
+  cleanupGuildRunSandbox,
+  prepareGuildRunSandbox,
+} from "../dispatch/guild-run-sandbox.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
@@ -6794,6 +6799,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     activeRunExecutions.add(run.id);
 
+    // Plan 3 Phase E1b: per-run guild worker state, hoisted to the
+    // outer scope so the outer try/catch/finally can clean up the
+    // sandbox dir if the (future) Phase E2b worker-exit hook didn't
+    // already do it. Both default to no-op semantics: a non-guild run
+    // never touches guildSandboxDir, and guildLearningsIngested stays
+    // false until E2b sets it.
+    let guildSandboxDir: string | null = null;
+    let guildLearningsIngested = false;
+
     try {
     const agent = await getAgent(run.agentId);
     if (!agent) {
@@ -7677,7 +7691,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       };
 
-      const adapter = getServerAdapter(agent.adapterType);
+      // Plan 3 Phase E1b: when agent.kind === 'guild' the adapter is
+      // resolved from adapterConfig.workerAdapterType (default
+      // 'hermes_local'), NOT from the persisted adapter_type. Rationale
+      // in design spec D2: the guild row's adapter_type is a category
+      // mistake for a row that doesn't itself execute; the worker
+      // adapter is what runs. Defaults preserve hermes_local for
+      // guild rows that omit the override; non-guild rows are
+      // untouched.
+      const workerAdapterType =
+        agent.kind === "guild"
+          ? (readNonEmptyString(parseObject(agent.adapterConfig).workerAdapterType) ?? "hermes_local")
+          : agent.adapterType;
+      const adapter = getServerAdapter(workerAdapterType);
       const authToken = adapter.supportsLocalAgentJwt
         ? createLocalAgentJwt(agent.id, agent.companyId, agent.adapterType, run.id)
         : null;
@@ -7710,19 +7736,71 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       resolvedRoutingTier = routingOverride.resolution.tier;
       resolvedRoutingModel = routingOverride.resolution.entry.model;
+      // Plan 3 Phase E1b: for kind='guild' runs, mkdtemp a per-run
+      // sandbox now (before adapter.execute), copy in autonomy.json,
+      // and write an empty available_skills.json placeholder (E1c
+      // will populate the snapshot from the DB). Sandbox warnings
+      // are non-fatal: a missing autonomy.json or instructionsRootPath
+      // degrades the worker envelope but does not block the run.
+      if (agent.kind === "guild") {
+        const instructionsRoot = readNonEmptyString(persistedAgentAdapterConfig.instructionsRootPath);
+        const prep = await prepareGuildRunSandbox({
+          runId: run.id,
+          guildId: agent.id,
+          guildSlug: agent.name,
+          guildInstructionsRoot: instructionsRoot,
+          skills: [],
+        });
+        guildSandboxDir = prep.sandboxDir;
+        for (const warning of prep.warnings) {
+          logger.warn(
+            { runId: run.id, agentId: agent.id, sandboxDir: guildSandboxDir },
+            warning,
+          );
+        }
+      }
+      // Plan 3 Phase E1b: layer guild worker env on top of the Plan 2
+      // routing override env. Guild keys (GUILD_*, WORKER_*,
+      // MEMORY_SERVICE_PROJECT) are distinct from routing keys
+      // (HERMES_*); the spread order places routing override last so
+      // it wins on any future collision (per design spec D8). For
+      // non-guild agents buildGuildWorkerEnv returns {}, so the
+      // composition is identical to the pre-Phase-E behaviour.
+      const guildEnv = guildSandboxDir
+        ? buildGuildWorkerEnv({ agent, sandboxDir: guildSandboxDir })
+        : {};
       const wrappedAgent = {
         ...agent,
         adapterConfig: {
           ...persistedAgentAdapterConfig,
-          env: routingOverride.env,
+          env: { ...guildEnv, ...routingOverride.env },
         },
       };
+      // Plan 3 Phase E1b: also layer guildEnv into runtimeConfig.env.
+      // Adapters read env from one of two places: the hermes wrapper
+      // reads `ctx.agent.adapterConfig.env` (covered by wrappedAgent
+      // above); the process / claude / codex / etc. adapters read
+      // `ctx.config.env`. The two paths historically held the same
+      // bytes (resolvedConfig.env originates from agent.adapterConfig.env).
+      // Plan 2's routing override only affects hermes (HERMES_* keys)
+      // so it didn't need this dual-layer. Phase E's guild env is
+      // adapter-neutral (the process adapter used in tests, and the
+      // hermes adapter used in production, must both see GUILD_*).
+      const runtimeConfigForAdapter = guildSandboxDir
+        ? {
+            ...runtimeConfig,
+            env: {
+              ...guildEnv,
+              ...parseObject((runtimeConfig as unknown as Record<string, unknown>).env),
+            },
+          }
+        : runtimeConfig;
 
       let adapterResult = await adapter.execute({
         runId: run.id,
         agent: wrappedAgent,
         runtime: runtimeForAdapter,
-        config: runtimeConfig,
+        config: runtimeConfigForAdapter,
         context,
         runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
         executionTarget,
@@ -7839,12 +7917,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
         // Re-wrap the agent with escalated values. Operator pin is
-        // INTENTIONALLY overridden here (recovery > pin).
+        // INTENTIONALLY overridden here (recovery > pin). Plan 3
+        // Phase E1b: guild env is layered first so the escalated retry
+        // sees the same GUILD_* / WORKER_* / MEMORY_SERVICE_PROJECT
+        // env the initial attempt saw. The HERMES_* override keys
+        // remain authoritative because they come last in the spread.
         const escalatedAgent = {
           ...agent,
           adapterConfig: {
             ...persistedAgentAdapterConfig,
             env: {
+              ...guildEnv,
               ...parseObject(persistedAgentAdapterConfig.env),
               HERMES_MODEL_OVERRIDE: { type: "plain", value: escalatedEntry.model },
               HERMES_PROVIDER_OVERRIDE: { type: "plain", value: escalatedEntry.provider },
@@ -7858,7 +7941,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           runId: run.id,
           agent: escalatedAgent,
           runtime: runtimeForAdapter,
-          config: runtimeConfig,
+          config: runtimeConfigForAdapter,
           context,
           runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
           executionTarget,
@@ -8304,6 +8387,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             failureReason: latestRun?.error ?? undefined,
           });
           await releaseRuntimeServicesForRun(run.id).catch(() => undefined);
+          // Plan 3 Phase E1b: best-effort cleanup of the guild
+          // worker sandbox dir if the (future) Phase E2b worker-exit
+          // hook didn't already handle it. The hook will set
+          // guildLearningsIngested=true after explicit ingest+cleanup;
+          // until then the finally is the sole cleanup path. Failures
+          // are warn-logged but never rethrown.
+          if (guildSandboxDir && !guildLearningsIngested) {
+            const sandboxToClean = guildSandboxDir;
+            const cleanup = await cleanupGuildRunSandbox(sandboxToClean);
+            if (cleanup.warning) {
+              logger.warn(
+                {
+                  runId: run.id,
+                  agentId: run.agentId,
+                  sandboxDir: sandboxToClean,
+                },
+                cleanup.warning,
+              );
+            }
+          }
           activeRunExecutions.delete(run.id);
           await startNextQueuedRunForAgent(run.agentId);
         }
