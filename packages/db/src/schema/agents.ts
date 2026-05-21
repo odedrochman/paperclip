@@ -18,6 +18,14 @@ export const agents = pgTable(
     companyId: uuid("company_id").notNull().references(() => companies.id),
     name: text("name").notNull(),
     role: text("role").notNull().default("general"),
+    // Plan 3 v2 organisation: discriminates an "agent" (individual persistent
+    // claude-cli or hermes identity) from a "guild" (persistent knowledge bank
+    // that spawns ephemeral workers per task) and from future "orchestrator"
+    // (COO, Plan 3c) or "worker" (transient runtime instance) kinds. All
+    // existing rows default to "agent" so behavior is unchanged for the
+    // CEO/CTO/CMO/UX legacy agents and hermes-pilot until they are explicitly
+    // opted into a different kind.
+    kind: text("kind", { enum: ["agent", "guild", "orchestrator", "worker"] }).notNull().default("agent"),
     tierPreference: text("tier_preference", { enum: ["local", "fast", "default", "heavy"] }).notNull().default("default"),
     title: text("title"),
     icon: text("icon"),
