@@ -24,7 +24,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import {
@@ -71,86 +71,47 @@ async function waitForRunToFinish(
   return await heartbeat.getRun(runId);
 }
 
-/**
- * waitForRunToFinish returns when `heartbeat_runs.status` flips
- * terminal — i.e. inside `setRunStatus`. The dispatcher's tail
- * (post-setRunStatus `appendRunEvent`s for `guild.ingest` +
- * `lifecycle`, then `finalizeAgentStatus`) is still running at that
- * point. The afterEach cleanup races with those tail writes and
- * occasionally trips the heartbeat_run_events FK.
- *
- * finalizeAgentStatus is the LAST DB write the inner-try block
- * makes (line ~8167 in heartbeat.ts). It sets agents.status to
- * 'idle' (or 'error' / etc.) and never back to 'running' for this
- * run. So polling for agents.status to leave 'running' is the
- * deterministic signal that the entire dispatcher tail has drained.
- */
-async function waitForAgentIdle(
-  db: ReturnType<typeof createDb>,
-  agentId: string,
-  timeoutMs = 5_000,
-) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const rows = await db
-      .select({ status: agents.status })
-      .from(agents)
-      .where(eq(agents.id, agentId));
-    const status = rows[0]?.status;
-    if (status && status !== "running") return status;
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  return null;
-}
-
 describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
   let db!: ReturnType<typeof createDb>;
+  let heartbeat!: ReturnType<typeof heartbeatService>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let testTmpRoot!: string;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-guild-dispatch-");
     db = createDb(tempDb.connectionString);
+    // ONE heartbeatService instance shared across all tests in this
+    // file so `activeRunExecutions` reflects EVERY dispatch — required
+    // for the drain-on-afterEach pattern below to actually drain.
+    heartbeat = heartbeatService(db);
     testTmpRoot = await fs.mkdtemp(path.join(os.tmpdir(), "heartbeat-guild-dispatch-test-"));
   }, 20_000);
 
   afterEach(async () => {
-    // Two-layer defense against the dispatcher-tail / cleanup race:
+    // Drain the dispatcher BEFORE deleting anything. `drainActiveRuns`
+    // returns once `activeRunExecutions` is empty, which is the LAST
+    // in-memory side-effect of `executeRun`'s outer `finally` (after
+    // releaseEnvironmentLeasesForRun, releaseRuntimeServicesForRun,
+    // and startNextQueuedRunForAgent all complete). With that signal
+    // there's no concurrent dispatcher writing rows behind our backs,
+    // so the per-table delete chain in FK-aware order is safe.
     //
-    //  1. Drain: poll until no agent.status='running' rows remain.
-    //     `finalizeAgentStatus` is the LAST inner-try write so this
-    //     is the deterministic "inner try done" signal. Capped at
-    //     15s for slow CI runners; the outer finally's
-    //     releaseEnvironmentLeasesForRun and other tail work may
-    //     still append rows AFTER finalizeAgentStatus, which is why
-    //     we need step 2 too.
-    //
-    //  2. TRUNCATE ... CASCADE on heartbeat_runs: a single atomic
-    //     statement that takes an ACCESS EXCLUSIVE lock on the
-    //     table, waits for any in-flight transaction touching it to
-    //     commit, then truncates. CASCADE atomically truncates all
-    //     referencing rows in activity_log + heartbeat_run_events +
-    //     agent_wakeup_requests in the same statement, so no FK
-    //     window for new writes to slip into. Replaces the per-table
-    //     `db.delete(...)` chain for the FK-tangled core; non-tangled
-    //     tables (skills, environments, agents, companies) still get
-    //     ordinary deletes after.
-    const drainDeadline = Date.now() + 15_000;
-    while (Date.now() < drainDeadline) {
-      const stillRunning = await db
-        .select({ id: agents.id })
-        .from(agents)
-        .where(eq(agents.status, "running"));
-      if (stillRunning.length === 0) break;
-      await new Promise((resolve) => setTimeout(resolve, 25));
+    // Earlier attempts using `waitForRunToFinish` alone (returns at
+    // setRunStatus) and `agents.status='running'` polling (catches
+    // inner-try writes but not outer-finally) both failed on CI under
+    // load. TRUNCATE CASCADE deadlocked against dispatcher RowShareLock
+    // holders. `drainActiveRuns` is the canonical signal.
+    const drained = await heartbeat.drainActiveRuns(15_000);
+    if (!drained) {
+      throw new Error(
+        "heartbeat-guild-dispatch.test.ts: active runs failed to drain within 15s; refusing to delete with dispatcher still writing",
+      );
     }
-    await db.execute(sql`TRUNCATE TABLE heartbeat_runs CASCADE`);
     await db.delete(environmentLeases);
     await db.delete(environments);
-    // agent_wakeup_requests has FKs to BOTH heartbeat_runs (cleared
-    // by the TRUNCATE CASCADE above) AND agents. Rows that didn't
-    // reference a heartbeat_run survive the TRUNCATE; explicit delete
-    // gets them before the agents delete below.
+    await db.delete(activityLog);
+    await db.delete(heartbeatRunEvents);
+    await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(companySkills);
@@ -251,7 +212,7 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
       permissions: {},
     });
 
-    const heartbeat = heartbeatService(db);
+
     const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     expect(queued).not.toBeNull();
 
@@ -301,7 +262,7 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
       permissions: {},
     });
 
-    const heartbeat = heartbeatService(db);
+
     const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     expect(queued).not.toBeNull();
 
@@ -342,7 +303,7 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
       permissions: {},
     });
 
-    const heartbeat = heartbeatService(db);
+
     const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     const finished = await waitForRunToFinish(heartbeat, queued!.id);
     expect(finished?.status).toBe("succeeded");
@@ -418,7 +379,7 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
       },
     ]);
 
-    const heartbeat = heartbeatService(db);
+
     const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     const finished = await waitForRunToFinish(heartbeat, queued!.id);
     expect(finished?.status).toBe("succeeded");
@@ -471,7 +432,7 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
       permissions: {},
     });
 
-    const heartbeat = heartbeatService(db);
+
     const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     const finished = await waitForRunToFinish(heartbeat, queued!.id);
     expect(finished?.status).toBe("succeeded");
@@ -536,7 +497,7 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
       permissions: {},
     });
 
-    const heartbeat = heartbeatService(db);
+
     const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     const finished = await waitForRunToFinish(heartbeat, queued!.id);
     expect(finished?.status).toBe("succeeded");
@@ -580,7 +541,7 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
       permissions: {},
     });
 
-    const heartbeat = heartbeatService(db);
+
     const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     const finished = await waitForRunToFinish(heartbeat, queued!.id);
     expect(finished?.status).toBe("succeeded");
@@ -626,7 +587,7 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
       permissions: {},
     });
 
-    const heartbeat = heartbeatService(db);
+
     const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     const finished = await waitForRunToFinish(heartbeat, queued!.id);
     expect(finished?.status).toBe("succeeded");
@@ -698,7 +659,7 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
       permissions: {},
     });
 
-    const heartbeat = heartbeatService(db);
+
     const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     const finished = await waitForRunToFinish(heartbeat, queued!.id);
     expect(finished?.status).toBe("succeeded");
@@ -763,7 +724,7 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
       },
     ]);
 
-    const heartbeat = heartbeatService(db);
+
     const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     const finished = await waitForRunToFinish(heartbeat, queued!.id);
     expect(finished?.status).toBe("succeeded");

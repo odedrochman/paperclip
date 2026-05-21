@@ -10446,5 +10446,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .limit(1);
       return run ?? null;
     },
+
+    /**
+     * Wait for all in-flight run executions to fully drain.
+     *
+     * `activeRunExecutions` is added to at the start of `executeRun`
+     * and removed in its outer `finally`. So an empty set means every
+     * dispatch — including its outer-finally cleanup
+     * (releaseEnvironmentLeasesForRun, releaseRuntimeServicesForRun,
+     * startNextQueuedRunForAgent) — has fully completed.
+     *
+     * Returns `true` once the set is empty within `timeoutMs`, or
+     * `false` if the deadline elapses with runs still in flight.
+     *
+     * Test cleanup uses this as the deterministic "safe to delete"
+     * signal — without it, `afterEach` races the outer-finally writes
+     * (activity_log, environment_leases, etc.) and trips FK
+     * constraints on the deletes.
+     *
+     * Production graceful-shutdown hooks may also use this before
+     * tearing down the DB pool.
+     */
+    drainActiveRuns: async (timeoutMs = 30_000): Promise<boolean> => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (activeRunExecutions.size === 0) return true;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      return activeRunExecutions.size === 0;
+    },
   };
 }
