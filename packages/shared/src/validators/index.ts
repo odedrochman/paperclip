@@ -84,6 +84,20 @@ export {
   type AgentSkillSync,
 } from "./adapter-skills.js";
 export {
+  guildSkillProvenanceSchema,
+  guildSkillSchema,
+  guildSkillCreateSchema,
+  guildSkillUpdateSchema,
+  guildSkillRecordUseSchema,
+  guildSkillListQuerySchema,
+  type GuildSkill,
+  type GuildSkillCreate,
+  type GuildSkillUpdate,
+  type GuildSkillRecordUse,
+  type GuildSkillListQuery,
+  type GuildSkillProvenance,
+} from "./guild-skill.js";
+export {
   portabilityIncludeSchema,
   portabilityEnvInputSchema,
   portabilityCompanyManifestEntrySchema,
