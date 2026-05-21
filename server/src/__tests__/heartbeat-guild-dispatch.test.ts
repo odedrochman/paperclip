@@ -71,6 +71,38 @@ async function waitForRunToFinish(
   return await heartbeat.getRun(runId);
 }
 
+/**
+ * waitForRunToFinish returns when `heartbeat_runs.status` flips
+ * terminal — i.e. inside `setRunStatus`. The dispatcher's tail
+ * (post-setRunStatus `appendRunEvent`s for `guild.ingest` +
+ * `lifecycle`, then `finalizeAgentStatus`) is still running at that
+ * point. The afterEach cleanup races with those tail writes and
+ * occasionally trips the heartbeat_run_events FK.
+ *
+ * finalizeAgentStatus is the LAST DB write the inner-try block
+ * makes (line ~8167 in heartbeat.ts). It sets agents.status to
+ * 'idle' (or 'error' / etc.) and never back to 'running' for this
+ * run. So polling for agents.status to leave 'running' is the
+ * deterministic signal that the entire dispatcher tail has drained.
+ */
+async function waitForAgentIdle(
+  db: ReturnType<typeof createDb>,
+  agentId: string,
+  timeoutMs = 5_000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const rows = await db
+      .select({ status: agents.status })
+      .from(agents)
+      .where(eq(agents.id, agentId));
+    const status = rows[0]?.status;
+    if (status && status !== "running") return status;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return null;
+}
+
 describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -83,6 +115,24 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
   }, 20_000);
 
   afterEach(async () => {
+    // The dispatcher's tail (appendRunEvent for guild.ingest +
+    // lifecycle, then finalizeAgentStatus) runs AFTER setRunStatus
+    // flips terminal status, which is when waitForRunToFinish
+    // returns. afterEach starting cleanup before the tail drains
+    // races with heartbeat_run_events writes and trips the FK on
+    // the heartbeat_runs delete. Wait for every agent to leave
+    // 'running' before touching the tables — finalizeAgentStatus
+    // is the LAST inner-try write, so this is the deterministic
+    // drained signal.
+    const drainDeadline = Date.now() + 5_000;
+    while (Date.now() < drainDeadline) {
+      const stillRunning = await db
+        .select({ id: agents.id })
+        .from(agents)
+        .where(eq(agents.status, "running"));
+      if (stillRunning.length === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     await db.delete(environmentLeases);
     await db.delete(environments);
     await db.delete(activityLog);

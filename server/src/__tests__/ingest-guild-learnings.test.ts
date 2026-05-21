@@ -12,6 +12,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import {
@@ -61,7 +62,18 @@ describeEmbeddedPostgres("ingestGuildLearnings (Plan 3 Phase E2a)", () => {
     // Mirror the full FK-aware teardown other heartbeat tests use so
     // this file is safe to run alongside files that exercise the
     // real heartbeat service (which writes activity_log,
-    // heartbeat_run_events, agentWakeupRequests, etc.).
+    // heartbeat_run_events, agentWakeupRequests, etc.). Wait for any
+    // dispatcher tail to drain before touching tables — see the
+    // matching afterEach in heartbeat-guild-dispatch.test.ts.
+    const drainDeadline = Date.now() + 5_000;
+    while (Date.now() < drainDeadline) {
+      const stillRunning = await db
+        .select({ id: agents.id })
+        .from(agents)
+        .where(eq(agents.status, "running"));
+      if (stillRunning.length === 0) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     await db.delete(environmentLeases);
     await db.delete(environments);
     await db.delete(activityLog);
