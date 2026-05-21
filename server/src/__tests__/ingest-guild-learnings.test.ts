@@ -12,7 +12,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import {
@@ -59,13 +59,12 @@ describeEmbeddedPostgres("ingestGuildLearnings (Plan 3 Phase E2a)", () => {
   }, 20_000);
 
   afterEach(async () => {
-    // Mirror the full FK-aware teardown other heartbeat tests use so
-    // this file is safe to run alongside files that exercise the
-    // real heartbeat service (which writes activity_log,
-    // heartbeat_run_events, agentWakeupRequests, etc.). Wait for any
-    // dispatcher tail to drain before touching tables — see the
-    // matching afterEach in heartbeat-guild-dispatch.test.ts.
-    const drainDeadline = Date.now() + 5_000;
+    // See the matching afterEach in heartbeat-guild-dispatch.test.ts
+    // for the rationale behind the two-layer defense (drain wait +
+    // TRUNCATE CASCADE). The drain wait covers the inner-try work;
+    // TRUNCATE CASCADE atomically handles any tail writes from the
+    // outer finally that get past the drain.
+    const drainDeadline = Date.now() + 15_000;
     while (Date.now() < drainDeadline) {
       const stillRunning = await db
         .select({ id: agents.id })
@@ -74,15 +73,13 @@ describeEmbeddedPostgres("ingestGuildLearnings (Plan 3 Phase E2a)", () => {
       if (stillRunning.length === 0) break;
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
+    await db.execute(sql`TRUNCATE TABLE heartbeat_runs CASCADE`);
     await db.delete(environmentLeases);
     await db.delete(environments);
-    await db.delete(activityLog);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(skills);
-    await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(companySkills);
+    await db.delete(skills);
     await db.delete(agents);
     await db.delete(companies);
   });

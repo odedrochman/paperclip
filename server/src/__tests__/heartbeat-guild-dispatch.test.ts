@@ -24,7 +24,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import {
@@ -115,16 +115,27 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
   }, 20_000);
 
   afterEach(async () => {
-    // The dispatcher's tail (appendRunEvent for guild.ingest +
-    // lifecycle, then finalizeAgentStatus) runs AFTER setRunStatus
-    // flips terminal status, which is when waitForRunToFinish
-    // returns. afterEach starting cleanup before the tail drains
-    // races with heartbeat_run_events writes and trips the FK on
-    // the heartbeat_runs delete. Wait for every agent to leave
-    // 'running' before touching the tables — finalizeAgentStatus
-    // is the LAST inner-try write, so this is the deterministic
-    // drained signal.
-    const drainDeadline = Date.now() + 5_000;
+    // Two-layer defense against the dispatcher-tail / cleanup race:
+    //
+    //  1. Drain: poll until no agent.status='running' rows remain.
+    //     `finalizeAgentStatus` is the LAST inner-try write so this
+    //     is the deterministic "inner try done" signal. Capped at
+    //     15s for slow CI runners; the outer finally's
+    //     releaseEnvironmentLeasesForRun and other tail work may
+    //     still append rows AFTER finalizeAgentStatus, which is why
+    //     we need step 2 too.
+    //
+    //  2. TRUNCATE ... CASCADE on heartbeat_runs: a single atomic
+    //     statement that takes an ACCESS EXCLUSIVE lock on the
+    //     table, waits for any in-flight transaction touching it to
+    //     commit, then truncates. CASCADE atomically truncates all
+    //     referencing rows in activity_log + heartbeat_run_events +
+    //     agent_wakeup_requests in the same statement, so no FK
+    //     window for new writes to slip into. Replaces the per-table
+    //     `db.delete(...)` chain for the FK-tangled core; non-tangled
+    //     tables (skills, environments, agents, companies) still get
+    //     ordinary deletes after.
+    const drainDeadline = Date.now() + 15_000;
     while (Date.now() < drainDeadline) {
       const stillRunning = await db
         .select({ id: agents.id })
@@ -133,11 +144,13 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
       if (stillRunning.length === 0) break;
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
+    await db.execute(sql`TRUNCATE TABLE heartbeat_runs CASCADE`);
     await db.delete(environmentLeases);
     await db.delete(environments);
-    await db.delete(activityLog);
-    await db.delete(heartbeatRunEvents);
-    await db.delete(heartbeatRuns);
+    // agent_wakeup_requests has FKs to BOTH heartbeat_runs (cleared
+    // by the TRUNCATE CASCADE above) AND agents. Rows that didn't
+    // reference a heartbeat_run survive the TRUNCATE; explicit delete
+    // gets them before the agents delete below.
     await db.delete(agentWakeupRequests);
     await db.delete(agentRuntimeState);
     await db.delete(companySkills);
