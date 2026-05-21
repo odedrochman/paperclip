@@ -128,6 +128,22 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
     ].join(" ");
   }
 
+  /** Worker script: write a learnings.json file at WORKER_LEARNINGS_PATH
+   * with the given payload. Atomic via .partial-then-rename per the
+   * spec D12 worker contract. */
+  function learningsWriteScript(learnings: { skills: Array<{ name: string; body: string }> }) {
+    return [
+      `const fs = require('node:fs');`,
+      `const dst = process.env.WORKER_LEARNINGS_PATH;`,
+      `if (dst) {`,
+      `  const payload = ${JSON.stringify(JSON.stringify(learnings))};`,
+      `  fs.writeFileSync(dst + '.partial', payload);`,
+      `  fs.renameSync(dst + '.partial', dst);`,
+      `}`,
+      `process.exit(0);`,
+    ].join(" ");
+  }
+
   async function setupCompany() {
     const companyId = randomUUID();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
@@ -358,6 +374,164 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
     expect(Object.keys(snapshot.skills[0]).sort()).toEqual(["body", "id", "name"]);
     // snapshotAt is a real timestamp
     expect(() => new Date(snapshot.snapshotAt).toISOString()).not.toThrow();
+  }, 30_000);
+
+  it("(E2b) worker-exit hook ingests learnings.json as provisional skills with createdByRunId, persists resultJson marker, cleans sandbox", async () => {
+    const companyId = await setupCompany();
+    const agentId = randomUUID();
+    const bundleRoot = await fs.mkdtemp(path.join(testTmpRoot, "e2b-bundle-"));
+    await fs.writeFile(path.join(bundleRoot, "autonomy.json"), "{}", "utf-8");
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "e2b-guild",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      kind: "guild",
+      adapterConfig: {
+        workerAdapterType: "process",
+        instructionsRootPath: bundleRoot,
+        command: process.execPath,
+        args: [
+          "-e",
+          learningsWriteScript({
+            skills: [
+              { name: "e2b-learned-skill-a", body: "First thing the worker learned" },
+              { name: "e2b-learned-skill-b", body: "Second thing the worker learned" },
+            ],
+          }),
+        ],
+      },
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const heartbeat = heartbeatService(db);
+    const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    const finished = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(finished?.status).toBe("succeeded");
+
+    // Two new provisional skills should exist, FK'd to this run.
+    const persisted = await db
+      .select()
+      .from(skills)
+      .where(eq(skills.guildId, agentId));
+    expect(persisted).toHaveLength(2);
+    const names = persisted.map((row) => row.name).sort();
+    expect(names).toEqual(["e2b-learned-skill-a", "e2b-learned-skill-b"]);
+    for (const row of persisted) {
+      expect(row.provenance).toBe("provisional");
+      expect(row.createdByRunId).toBe(queued!.id);
+      expect(row.companyId).toBe(companyId);
+    }
+
+    // resultJson should carry the marker with ingestedCount=2.
+    const marker = (finished?.resultJson as Record<string, unknown>)
+      ?.guildLearningsIngested as Record<string, unknown> | undefined;
+    expect(marker).toBeTruthy();
+    expect(marker?.ingestedCount).toBe(2);
+    expect(marker?.rejectedCount).toBe(0);
+    expect(marker?.fileMissing).toBe(false);
+    expect(typeof marker?.sandboxDir).toBe("string");
+    expect(() => new Date(String(marker?.at)).toISOString()).not.toThrow();
+    const ingestedList = marker?.ingested as Array<{ id: string; name: string }>;
+    expect(ingestedList).toHaveLength(2);
+    expect(ingestedList.map((s) => s.name).sort()).toEqual([
+      "e2b-learned-skill-a",
+      "e2b-learned-skill-b",
+    ]);
+
+    // Sandbox dir should be gone after the explicit cleanup.
+    const sandboxDir = String(marker?.sandboxDir);
+    await expect(fs.access(sandboxDir)).rejects.toThrow();
+  }, 30_000);
+
+  it("(E2b) worker writes nothing: marker records fileMissing=true with zero ingested", async () => {
+    const companyId = await setupCompany();
+    const agentId = randomUUID();
+    const bundleRoot = await fs.mkdtemp(path.join(testTmpRoot, "e2b-nolearn-bundle-"));
+    await fs.writeFile(path.join(bundleRoot, "autonomy.json"), "{}", "utf-8");
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "e2b-nolearn-guild",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      kind: "guild",
+      adapterConfig: {
+        workerAdapterType: "process",
+        instructionsRootPath: bundleRoot,
+        command: process.execPath,
+        // Worker that does nothing — no learnings.json written.
+        args: ["-e", "process.exit(0);"],
+      },
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const heartbeat = heartbeatService(db);
+    const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    const finished = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(finished?.status).toBe("succeeded");
+
+    expect(await db.select().from(skills).where(eq(skills.guildId, agentId))).toEqual([]);
+
+    const marker = (finished?.resultJson as Record<string, unknown>)
+      ?.guildLearningsIngested as Record<string, unknown>;
+    expect(marker.ingestedCount).toBe(0);
+    expect(marker.rejectedCount).toBe(0);
+    expect(marker.fileMissing).toBe(true);
+  }, 30_000);
+
+  it("(E2b) malformed learnings.json: marker records topLevelError, no skills ingested, sandbox still cleaned", async () => {
+    const companyId = await setupCompany();
+    const agentId = randomUUID();
+    const bundleRoot = await fs.mkdtemp(path.join(testTmpRoot, "e2b-malformed-bundle-"));
+    await fs.writeFile(path.join(bundleRoot, "autonomy.json"), "{}", "utf-8");
+
+    const malformedScript = [
+      `const fs = require('node:fs');`,
+      `fs.writeFileSync(process.env.WORKER_LEARNINGS_PATH, '{this is not json}');`,
+      `process.exit(0);`,
+    ].join(" ");
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "e2b-malformed-guild",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      kind: "guild",
+      adapterConfig: {
+        workerAdapterType: "process",
+        instructionsRootPath: bundleRoot,
+        command: process.execPath,
+        args: ["-e", malformedScript],
+      },
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const heartbeat = heartbeatService(db);
+    const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    const finished = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(finished?.status).toBe("succeeded");
+
+    expect(await db.select().from(skills).where(eq(skills.guildId, agentId))).toEqual([]);
+
+    const marker = (finished?.resultJson as Record<string, unknown>)
+      ?.guildLearningsIngested as Record<string, unknown>;
+    expect(marker.ingestedCount).toBe(0);
+    expect(marker.fileMissing).toBe(false);
+    expect(typeof marker.topLevelError).toBe("string");
+    expect(String(marker.topLevelError)).toMatch(/valid JSON/);
+
+    await expect(fs.access(String(marker.sandboxDir))).rejects.toThrow();
   }, 30_000);
 
   it("(E1c) snapshot is empty when the guild has no canonical skills (worker still spawns successfully)", async () => {

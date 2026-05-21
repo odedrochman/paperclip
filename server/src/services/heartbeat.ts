@@ -66,6 +66,10 @@ import {
   cleanupGuildRunSandbox,
   prepareGuildRunSandbox,
 } from "../dispatch/guild-run-sandbox.js";
+import {
+  ingestGuildLearnings,
+  type IngestGuildLearningsResult,
+} from "../dispatch/ingest-guild-learnings.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
@@ -6784,6 +6788,97 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
+  /**
+   * Plan 3 Phase E2b: run the worker-exit hook for guild dispatches.
+   *
+   * Reads `<sandboxDir>/learnings.json` via `ingestGuildLearnings`,
+   * cleans up the sandbox dir, and returns the resultJson with a
+   * `guildLearningsIngested` marker merged in. For non-guild runs
+   * (no sandbox dir) returns the resultJson unchanged.
+   *
+   * All failures are caught and logged at WARN; the run's terminal
+   * status is never blocked by ingest issues. The `cleanedSandbox`
+   * return flag signals the caller to flip `guildLearningsIngested`
+   * so the outer finally skips its own cleanup pass.
+   */
+  async function ingestGuildLearningsIntoResult(args: {
+    agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "kind" | "name">;
+    run: { id: string };
+    guildSandboxDir: string | null;
+    baseResultJson: Record<string, unknown> | null;
+  }): Promise<{
+    resultJson: Record<string, unknown> | null;
+    cleanedSandbox: boolean;
+  }> {
+    if (args.agent.kind !== "guild" || !args.guildSandboxDir) {
+      return { resultJson: args.baseResultJson, cleanedSandbox: false };
+    }
+    const sandboxDir = args.guildSandboxDir;
+    let ingest: IngestGuildLearningsResult;
+    try {
+      ingest = await ingestGuildLearnings({
+        db,
+        agent: args.agent,
+        run: args.run,
+        sandboxDir,
+      });
+    } catch (err) {
+      logger.warn(
+        { err, runId: args.run.id, agentId: args.agent.id, sandboxDir },
+        "guild dispatch: ingestGuildLearnings threw; persisting marker without ingest detail",
+      );
+      ingest = {
+        ingested: [],
+        rejected: [],
+        fileMissing: false,
+        topLevelError:
+          err instanceof Error ? err.message : "ingestGuildLearnings threw unexpectedly",
+      };
+    }
+    if (ingest.rejected.length > 0) {
+      logger.warn(
+        {
+          runId: args.run.id,
+          agentId: args.agent.id,
+          rejected: ingest.rejected,
+        },
+        "guild dispatch: some worker learnings were rejected by the hook",
+      );
+    }
+    if (ingest.topLevelError) {
+      logger.warn(
+        {
+          runId: args.run.id,
+          agentId: args.agent.id,
+          topLevelError: ingest.topLevelError,
+        },
+        "guild dispatch: learnings.json top-level error; no ingest",
+      );
+    }
+    const cleanup = await cleanupGuildRunSandbox(sandboxDir);
+    if (cleanup.warning) {
+      logger.warn(
+        { runId: args.run.id, agentId: args.agent.id, sandboxDir },
+        cleanup.warning,
+      );
+    }
+    const marker: Record<string, unknown> = {
+      at: new Date().toISOString(),
+      ingestedCount: ingest.ingested.length,
+      rejectedCount: ingest.rejected.length,
+      fileMissing: ingest.fileMissing,
+      sandboxDir,
+      ...(ingest.topLevelError ? { topLevelError: ingest.topLevelError } : {}),
+      ...(ingest.ingested.length > 0 ? { ingested: ingest.ingested } : {}),
+      ...(ingest.rejected.length > 0 ? { rejected: ingest.rejected } : {}),
+    };
+    const resultJson: Record<string, unknown> = {
+      ...(args.baseResultJson ?? {}),
+      guildLearningsIngested: marker,
+    };
+    return { resultJson, cleanedSandbox: true };
+  }
+
   async function executeRun(runId: string) {
     let run = await getRun(runId);
     if (!run) return;
@@ -8149,6 +8244,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // visible. totalCostUsd is null on cost-less runs (e.g. local
       // tier via ollama).
       const adapterReportedModel = readNonEmptyString(adapterResult.model);
+      // Plan 3 Phase E2b: ingest the worker's learnings.json BEFORE
+      // setRunStatus so the resultJson marker is persisted in the
+      // same DB write that flips the run terminal. The hook is
+      // best-effort: a failure (file read, JSON parse, bad shape)
+      // becomes a `topLevelError` in the marker rather than failing
+      // the run. Per-skill failures end up in `rejected[]`. After the
+      // ingest we explicitly cleanup the sandbox and flip
+      // `guildLearningsIngested=true` so the outer finally skips
+      // re-cleanup. Skipped entirely for non-guild runs (kind='agent'
+      // path is unchanged).
+      const persistedResultJsonWithGuild = await ingestGuildLearningsIntoResult({
+        agent,
+        run,
+        guildSandboxDir,
+        baseResultJson: persistedResultJson,
+      });
+      if (persistedResultJsonWithGuild.cleanedSandbox) {
+        guildLearningsIngested = true;
+      }
       let persistedRun = await setRunStatus(run.id, status, {
         finishedAt: new Date(),
         error: runErrorMessage,
@@ -8156,7 +8270,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         exitCode: adapterResult.exitCode,
         signal: adapterResult.signal,
         usageJson,
-        resultJson: persistedResultJson,
+        resultJson: persistedResultJsonWithGuild.resultJson,
         sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId,
         stdoutExcerpt,
         stderrExcerpt,
@@ -8294,14 +8408,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         logger.warn({ err: flushErr, runId }, "failed to flush run output progress after error");
       });
 
+      // Plan 3 Phase E2b: even on failed dispatch the worker may have
+      // written useful learnings before the inner catch fired. Honor
+      // them. For runs that never reached adapter.execute the file
+      // simply won't exist and the hook is a no-op.
+      const baseFailureResultJson = mergeRunStopMetadataForAgent(agent, "failed", {
+        errorCode: "adapter_failed",
+        errorMessage: message,
+      });
+      const failureResultWithGuild = await ingestGuildLearningsIntoResult({
+        agent,
+        run,
+        guildSandboxDir,
+        baseResultJson: baseFailureResultJson,
+      });
+      if (failureResultWithGuild.cleanedSandbox) {
+        guildLearningsIngested = true;
+      }
       const failedRun = await setRunStatus(run.id, "failed", {
         error: message,
         errorCode: "adapter_failed",
         finishedAt: new Date(),
-        resultJson: mergeRunStopMetadataForAgent(agent, "failed", {
-          errorCode: "adapter_failed",
-          errorMessage: message,
-        }),
+        resultJson: failureResultWithGuild.resultJson,
         stdoutExcerpt,
         stderrExcerpt,
         logBytes: logSummary?.bytes,
