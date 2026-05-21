@@ -6809,9 +6809,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }): Promise<{
     resultJson: Record<string, unknown> | null;
     cleanedSandbox: boolean;
+    /** Telemetry payload mirroring the `guildLearningsIngested` marker,
+     * for the caller to attach to a `guild.ingest` run event via
+     * `appendRunEvent`. Null when no ingest happened (non-guild run). */
+    ingestEventPayload: Record<string, unknown> | null;
   }> {
     if (args.agent.kind !== "guild" || !args.guildSandboxDir) {
-      return { resultJson: args.baseResultJson, cleanedSandbox: false };
+      return { resultJson: args.baseResultJson, cleanedSandbox: false, ingestEventPayload: null };
     }
     const sandboxDir = args.guildSandboxDir;
     let ingest: IngestGuildLearningsResult;
@@ -6872,11 +6876,53 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ...(ingest.ingested.length > 0 ? { ingested: ingest.ingested } : {}),
       ...(ingest.rejected.length > 0 ? { rejected: ingest.rejected } : {}),
     };
+    // Plan 3 Phase E3: post-hook telemetry. activity_log row is
+    // persistent + plugin-bus-published (action is in PLUGIN_EVENT_SET).
+    // Phase F's Telegram notifier subscribes to this event to alert
+    // the operator when a worker produced new provisional skills.
+    // Wrapped in try/catch — observability never blocks the run.
+    try {
+      await logActivity(db, {
+        companyId: args.agent.companyId,
+        actorType: "agent",
+        actorId: args.agent.id,
+        action: "guild.worker.skills_ingested",
+        entityType: "heartbeat_run",
+        entityId: args.run.id,
+        agentId: args.agent.id,
+        runId: args.run.id,
+        details: {
+          runId: args.run.id,
+          guildId: args.agent.id,
+          guildSlug: args.agent.name,
+          ingestedCount: ingest.ingested.length,
+          rejectedCount: ingest.rejected.length,
+          fileMissing: ingest.fileMissing,
+          ...(ingest.topLevelError ? { topLevelError: ingest.topLevelError } : {}),
+          ...(ingest.ingested.length > 0 ? { ingested: ingest.ingested } : {}),
+          ...(ingest.rejected.length > 0 ? { rejected: ingest.rejected } : {}),
+        },
+      });
+    } catch (telemetryErr) {
+      logger.warn(
+        { err: telemetryErr, runId: args.run.id, agentId: args.agent.id },
+        "guild dispatch: failed to write activity_log(guild.worker.skills_ingested)",
+      );
+    }
     const resultJson: Record<string, unknown> = {
       ...(args.baseResultJson ?? {}),
       guildLearningsIngested: marker,
     };
-    return { resultJson, cleanedSandbox: true };
+    const ingestEventPayload: Record<string, unknown> = {
+      runId: args.run.id,
+      guildId: args.agent.id,
+      guildSlug: args.agent.name,
+      ingestedCount: ingest.ingested.length,
+      rejectedCount: ingest.rejected.length,
+      fileMissing: ingest.fileMissing,
+      ...(ingest.topLevelError ? { topLevelError: ingest.topLevelError } : {}),
+    };
+    return { resultJson, cleanedSandbox: true, ingestEventPayload };
   }
 
   async function executeRun(runId: string) {
@@ -7876,6 +7922,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             warning,
           );
         }
+        // Plan 3 Phase E3: pre-spawn telemetry. Fire-and-forget run
+        // event + persistent activity_log row. logActivity also
+        // publishes to the plugin bus because the action is in
+        // PLUGIN_EVENT_SET (registered in @paperclipai/shared as
+        // 'guild.worker.dispatched'). Failures warn-log but never
+        // block dispatch.
+        const dispatchTelemetryPayload: Record<string, unknown> = {
+          runId: run.id,
+          guildId: agent.id,
+          guildSlug: agent.name,
+          sandboxDir: guildSandboxDir,
+          snapshotedSkillCount: prep.snapshotedSkillCount,
+          autonomyJsonAvailable: prep.autonomyJsonPath !== null,
+        };
+        try {
+          await appendRunEvent(currentRun, seq++, {
+            eventType: "guild.spawn",
+            stream: "system",
+            level: "info",
+            message: `guild worker dispatched (snapshot of ${prep.snapshotedSkillCount} canonical skill${
+              prep.snapshotedSkillCount === 1 ? "" : "s"
+            })`,
+            payload: dispatchTelemetryPayload,
+          });
+        } catch (telemetryErr) {
+          logger.warn(
+            { err: telemetryErr, runId: run.id, agentId: agent.id },
+            "guild dispatch: failed to append guild.spawn run event",
+          );
+        }
+        try {
+          await logActivity(db, {
+            companyId: agent.companyId,
+            actorType: "agent",
+            actorId: agent.id,
+            action: "guild.worker.dispatched",
+            entityType: "heartbeat_run",
+            entityId: run.id,
+            agentId: agent.id,
+            runId: run.id,
+            details: dispatchTelemetryPayload,
+          });
+        } catch (telemetryErr) {
+          logger.warn(
+            { err: telemetryErr, runId: run.id, agentId: agent.id },
+            "guild dispatch: failed to write activity_log(guild.worker.dispatched)",
+          );
+        }
       }
       // Plan 3 Phase E1b: layer guild worker env on top of the Plan 2
       // routing override env. Guild keys (GUILD_*, WORKER_*,
@@ -8293,6 +8387,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const finalizedRun = persistedRun ?? (await getRun(run.id));
       if (finalizedRun) {
+        // Plan 3 Phase E3: guild.ingest run event mirrors the
+        // activity_log row written by ingestGuildLearningsIntoResult.
+        // Emitted before the lifecycle event so the timeline reads
+        // "ingest -> terminal" which matches the actual ordering
+        // (ingest ran before setRunStatus). Skipped for non-guild runs.
+        if (persistedResultJsonWithGuild.ingestEventPayload) {
+          const payload = persistedResultJsonWithGuild.ingestEventPayload;
+          try {
+            await appendRunEvent(finalizedRun, seq++, {
+              eventType: "guild.ingest",
+              stream: "system",
+              level: "info",
+              message: `guild worker learnings ingested (${
+                Number(payload.ingestedCount ?? 0)
+              } skill${Number(payload.ingestedCount ?? 0) === 1 ? "" : "s"})`,
+              payload,
+            });
+          } catch (telemetryErr) {
+            logger.warn(
+              { err: telemetryErr, runId: run.id, agentId: agent.id },
+              "guild dispatch: failed to append guild.ingest run event",
+            );
+          }
+        }
         await appendRunEvent(finalizedRun, seq++, {
           eventType: "lifecycle",
           stream: "system",
@@ -8450,6 +8568,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       if (failedRun) {
+        // Plan 3 Phase E3: guild.ingest event for the failure path —
+        // even failed dispatches may have ingested learnings before
+        // the inner catch fired. The marker on resultJson already
+        // records the detail; this event is the timeline equivalent.
+        if (failureResultWithGuild.ingestEventPayload) {
+          const payload = failureResultWithGuild.ingestEventPayload;
+          try {
+            await appendRunEvent(failedRun, seq++, {
+              eventType: "guild.ingest",
+              stream: "system",
+              level: "info",
+              message: `guild worker learnings ingested (${
+                Number(payload.ingestedCount ?? 0)
+              } skill${Number(payload.ingestedCount ?? 0) === 1 ? "" : "s"}) before failure`,
+              payload,
+            });
+          } catch (telemetryErr) {
+            logger.warn(
+              { err: telemetryErr, runId: run.id, agentId: agent.id },
+              "guild dispatch: failed to append guild.ingest run event on failure path",
+            );
+          }
+        }
         await appendRunEvent(failedRun, seq++, {
           eventType: "error",
           stream: "system",

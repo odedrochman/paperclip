@@ -24,7 +24,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import {
@@ -532,6 +532,127 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
     expect(String(marker.topLevelError)).toMatch(/valid JSON/);
 
     await expect(fs.access(String(marker.sandboxDir))).rejects.toThrow();
+  }, 30_000);
+
+  it("(E3) telemetry: activity_log has guild.worker.dispatched + guild.worker.skills_ingested; heartbeat_run_events has guild.spawn + guild.ingest", async () => {
+    const companyId = await setupCompany();
+    const agentId = randomUUID();
+    const bundleRoot = await fs.mkdtemp(path.join(testTmpRoot, "e3-bundle-"));
+    await fs.writeFile(path.join(bundleRoot, "autonomy.json"), "{}", "utf-8");
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "e3-telemetry-guild",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      kind: "guild",
+      adapterConfig: {
+        workerAdapterType: "process",
+        instructionsRootPath: bundleRoot,
+        command: process.execPath,
+        args: [
+          "-e",
+          learningsWriteScript({
+            skills: [{ name: "e3-learned-once", body: "Whatever the worker learned" }],
+          }),
+        ],
+      },
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const heartbeat = heartbeatService(db);
+    const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    const finished = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(finished?.status).toBe("succeeded");
+
+    // activity_log assertions
+    const dispatchedRows = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(eq(activityLog.action, "guild.worker.dispatched"), eq(activityLog.runId, queued!.id)),
+      );
+    expect(dispatchedRows).toHaveLength(1);
+    const dispatched = dispatchedRows[0]!;
+    expect(dispatched.agentId).toBe(agentId);
+    expect(dispatched.companyId).toBe(companyId);
+    expect(dispatched.entityType).toBe("heartbeat_run");
+    expect(dispatched.entityId).toBe(queued!.id);
+    const dispatchedDetails = dispatched.details as Record<string, unknown>;
+    expect(dispatchedDetails.runId).toBe(queued!.id);
+    expect(dispatchedDetails.guildId).toBe(agentId);
+    expect(dispatchedDetails.guildSlug).toBe("e3-telemetry-guild");
+    expect(dispatchedDetails.snapshotedSkillCount).toBe(0);
+    expect(dispatchedDetails.autonomyJsonAvailable).toBe(true);
+    expect(typeof dispatchedDetails.sandboxDir).toBe("string");
+
+    const ingestedRows = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.action, "guild.worker.skills_ingested"),
+          eq(activityLog.runId, queued!.id),
+        ),
+      );
+    expect(ingestedRows).toHaveLength(1);
+    const ingestedDetails = ingestedRows[0]!.details as Record<string, unknown>;
+    expect(ingestedDetails.ingestedCount).toBe(1);
+    expect(ingestedDetails.rejectedCount).toBe(0);
+    expect(ingestedDetails.fileMissing).toBe(false);
+    expect(ingestedDetails.guildSlug).toBe("e3-telemetry-guild");
+
+    // run-event assertions
+    const runEvents = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, queued!.id));
+    const eventTypes = runEvents.map((row) => row.eventType);
+    expect(eventTypes).toContain("guild.spawn");
+    expect(eventTypes).toContain("guild.ingest");
+  }, 30_000);
+
+  it("(E3) non-guild dispatch emits NEITHER guild.worker.dispatched NOR guild.worker.skills_ingested", async () => {
+    const companyId = await setupCompany();
+    const agentId = randomUUID();
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "e3-non-guild",
+      role: "engineer",
+      status: "idle",
+      adapterType: "process",
+      // kind defaults to 'agent'
+      adapterConfig: {
+        command: process.execPath,
+        args: ["-e", "process.exit(0);"],
+      },
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const heartbeat = heartbeatService(db);
+    const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    const finished = await waitForRunToFinish(heartbeat, queued!.id);
+    expect(finished?.status).toBe("succeeded");
+
+    const guildActivity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.runId, queued!.id));
+    const guildActions = guildActivity.map((r) => r.action).filter((a) => a.startsWith("guild."));
+    expect(guildActions).toEqual([]);
+
+    const guildEvents = await db
+      .select()
+      .from(heartbeatRunEvents)
+      .where(eq(heartbeatRunEvents.runId, queued!.id));
+    const guildEventTypes = guildEvents.map((r) => r.eventType).filter((t) => t.startsWith("guild."));
+    expect(guildEventTypes).toEqual([]);
   }, 30_000);
 
   it("(E1c) snapshot is empty when the guild has no canonical skills (worker still spawns successfully)", async () => {
