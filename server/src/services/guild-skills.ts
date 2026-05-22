@@ -28,10 +28,21 @@ export type GuildSkillRow = typeof skills.$inferSelect;
 
 export function guildSkillService(db: Db) {
   /** Throws notFound if the guild does not exist within the company,
-   * or conflict if the target row exists but isn't a guild. */
-  async function assertGuild(companyId: string, guildId: string) {
+   * or conflict if the target row exists but isn't a guild. Returns
+   * the verified guild row so callers (e.g. the route layer) can read
+   * the guild's slug for activity_log emissions without a second
+   * round-trip. */
+  async function assertGuild(
+    companyId: string,
+    guildId: string,
+  ): Promise<{ id: string; name: string }> {
     const rows = await db
-      .select({ id: agents.id, kind: agents.kind, companyId: agents.companyId })
+      .select({
+        id: agents.id,
+        name: agents.name,
+        kind: agents.kind,
+        companyId: agents.companyId,
+      })
       .from(agents)
       .where(eq(agents.id, guildId))
       .limit(1);
@@ -45,6 +56,7 @@ export function guildSkillService(db: Db) {
           `the agent first or address a different agent.`,
       );
     }
+    return { id: row.id, name: row.name };
   }
 
   async function list(

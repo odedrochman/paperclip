@@ -1057,6 +1057,10 @@ export {
 } from "./validators/index.js";
 
 export { API_PREFIX, API } from "./api.js";
+export {
+  GUILD_SKILL_BODY_PREVIEW_MAX,
+  truncateGuildSkillBody,
+} from "./guild-skill-preview.js";
 export { normalizeAgentUrlKey, deriveAgentUrlKey, isUuidLike } from "./agent-url-key.js";
 export { deriveProjectUrlKey, normalizeProjectUrlKey, hasNonAsciiContent } from "./project-url-key.js";
 export {

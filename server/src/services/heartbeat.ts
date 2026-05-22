@@ -6892,6 +6892,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         agentId: args.agent.id,
         runId: args.run.id,
         details: {
+          // Discriminator added in Plan 3 Phase F follow-up so the
+          // operator + future audit queries can distinguish skills
+          // ingested via the worker-exit hook (learnings.json) from
+          // those created directly via POST /skills.
+          source: "exit-hook",
           runId: args.run.id,
           guildId: args.agent.id,
           guildSlug: args.agent.name,

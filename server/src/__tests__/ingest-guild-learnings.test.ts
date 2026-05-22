@@ -156,6 +156,13 @@ describeEmbeddedPostgres("ingestGuildLearnings (Plan 3 Phase E2a)", () => {
       "drizzle-fk-cascade-trap",
       "redis-connection-pooling",
     ]);
+    // Phase F follow-up: body is included on each ingested entry so
+    // the downstream notifier can render a preview without re-fetching.
+    const byName = new Map(result.ingested.map((s) => [s.name, s.body]));
+    expect(byName.get("redis-connection-pooling")).toBe("use a pool size of 20");
+    expect(byName.get("drizzle-fk-cascade-trap")).toBe(
+      "FK cascade can silently delete sibling rows",
+    );
 
     const persisted = await db.select().from(skills);
     expect(persisted).toHaveLength(2);
@@ -165,6 +172,39 @@ describeEmbeddedPostgres("ingestGuildLearnings (Plan 3 Phase E2a)", () => {
       expect(row.companyId).toBe(companyId);
       expect(row.createdByRunId).toBe(runId);
     }
+    await cleanup();
+  });
+
+  it("body field on ingested[] is truncated to the preview cap with an ellipsis", async () => {
+    const { companyId, agentId } = await seed("guild");
+    const runId = await seedRun(companyId, agentId);
+    // 700 chars — well over the 500-codepoint preview cap but under
+    // the 8 KB validator cap, so the row persists but the activity
+    // preview must trim.
+    const longBody = "a".repeat(700);
+    const { sandboxDir, cleanup } = await withSandbox(
+      JSON.stringify({ skills: [{ name: "long-skill", body: longBody }] }),
+    );
+
+    const result = await ingestGuildLearnings({
+      db,
+      agent: { id: agentId, companyId, kind: "guild", name: "eng-guild" },
+      run: { id: runId },
+      sandboxDir,
+    });
+
+    expect(result.ingested).toHaveLength(1);
+    const preview = result.ingested[0]!.body;
+    // 500 codepoints + trailing ellipsis = 501 codepoints total.
+    expect(Array.from(preview)).toHaveLength(501);
+    expect(preview.endsWith("…")).toBe(true);
+    expect(preview.slice(0, 500)).toBe("a".repeat(500));
+
+    // The persisted row still has the FULL body — the preview is only
+    // a derived field on the result, not a destructive transformation.
+    const persisted = await db.select().from(skills);
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0]!.body).toBe(longBody);
     await cleanup();
   });
 
