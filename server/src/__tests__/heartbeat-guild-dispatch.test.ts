@@ -628,6 +628,20 @@ describeEmbeddedPostgres("heartbeat guild dispatch (Plan 3 Phase E1b)", () => {
     expect(ingestedDetails.rejectedCount).toBe(0);
     expect(ingestedDetails.fileMissing).toBe(false);
     expect(ingestedDetails.guildSlug).toBe("e3-telemetry-guild");
+    // Phase F follow-up: emission carries a source discriminator so
+    // future audits can distinguish exit-hook vs direct-POST writes.
+    expect(ingestedDetails.source).toBe("exit-hook");
+    // Phase F follow-up: ingested[] entries carry a truncated body
+    // preview so the consumer (ceo-chat notifier) can render the
+    // skill body without re-fetching each row.
+    const ingestedArr = ingestedDetails.ingested as Array<{
+      id?: string;
+      name?: string;
+      body?: string;
+    }>;
+    expect(ingestedArr).toHaveLength(1);
+    expect(ingestedArr[0]!.name).toBe("e3-learned-once");
+    expect(ingestedArr[0]!.body).toBe("Whatever the worker learned");
 
     // run-event assertions
     const runEvents = await db

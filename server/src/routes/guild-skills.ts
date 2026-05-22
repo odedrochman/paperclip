@@ -33,12 +33,14 @@ import {
   guildSkillCreateSchema,
   guildSkillListQuerySchema,
   guildSkillRecordUseSchema,
+  truncateGuildSkillBody,
 } from "@paperclipai/shared";
 
 import { forbidden } from "../errors.js";
 import { validate } from "../middleware/validate.js";
-import { guildSkillService } from "../services/index.js";
-import { assertCompanyAccess } from "./authz.js";
+import { logger } from "../middleware/logger.js";
+import { guildSkillService, logActivity } from "../services/index.js";
+import { assertCompanyAccess, getActorInfo } from "./authz.js";
 
 export function guildSkillRoutes(db: Db) {
   const router = Router();
@@ -89,6 +91,58 @@ export function guildSkillRoutes(db: Db) {
       // on every insert, so a worker cannot mint a canonical skill
       // even if it tries.
       const created = await svc.create(companyId, guildId, req.body);
+      // Plan 3 Phase F follow-up: emit the same activity_log action the
+      // worker-exit hook emits, so the operator's notifier sees skills
+      // created directly via the API (workers can bypass the exit-hook
+      // path by POSTing here — observed in ROC-75 during the F5 smoke).
+      // Wrapped in try/catch — observability never blocks the response.
+      try {
+        const guild = await svc.assertGuild(companyId, guildId);
+        const actor = getActorInfo(req);
+        await logActivity(db, {
+          companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          action: "guild.worker.skills_ingested",
+          entityType: "guild_skill",
+          entityId: created.id,
+          // Anchor the row on the guild (not the caller) so the
+          // operator's "activity for guild X" filter and the
+          // notifier's guildSlug field both line up with the
+          // worker-exit-hook emission shape.
+          agentId: guildId,
+          runId: created.createdByRunId ?? null,
+          details: {
+            source: "direct-post",
+            runId: created.createdByRunId ?? null,
+            guildId,
+            guildSlug: guild.name,
+            ingestedCount: 1,
+            rejectedCount: 0,
+            // No file involved in the direct-POST path; surface false
+            // so consumers can distinguish "no learnings.json" from
+            // "didn't go through the file path at all".
+            fileMissing: false,
+            ingested: [
+              {
+                id: created.id,
+                name: created.name,
+                body: truncateGuildSkillBody(created.body),
+              },
+            ],
+          },
+        });
+      } catch (telemetryErr) {
+        logger.warn(
+          {
+            err: telemetryErr,
+            companyId,
+            guildId,
+            skillId: created.id,
+          },
+          "guild-skills POST: failed to write activity_log(guild.worker.skills_ingested)",
+        );
+      }
       res.status(201).json(created);
     },
   );

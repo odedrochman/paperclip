@@ -30,7 +30,7 @@ import path from "node:path";
 
 import type { Db } from "@paperclipai/db";
 import type { agents as agentsTable } from "@paperclipai/db";
-import { guildSkillCreateSchema } from "@paperclipai/shared";
+import { guildSkillCreateSchema, truncateGuildSkillBody } from "@paperclipai/shared";
 
 import { guildSkillService } from "../services/guild-skills.js";
 import { GUILD_WORKER_LEARNINGS_FILE } from "./guild-worker-env.js";
@@ -47,6 +47,14 @@ export interface IngestGuildLearningsInput {
 export interface IngestedSkill {
   id: string;
   name: string;
+  /**
+   * Truncated preview of the skill body, capped at
+   * GUILD_SKILL_BODY_PREVIEW_MAX codepoints with a trailing ellipsis
+   * when the original was longer. Included so downstream consumers
+   * (the ceo-chat Telegram notifier, the operator-facing activity_log
+   * row) can render a preview line without re-fetching each skill.
+   */
+  body: string;
 }
 
 export interface RejectedSkill {
@@ -172,7 +180,11 @@ export async function ingestGuildLearnings(
         input.agent.id,
         validation.data,
       );
-      ingested.push({ id: created.id, name: created.name });
+      ingested.push({
+        id: created.id,
+        name: created.name,
+        body: truncateGuildSkillBody(created.body),
+      });
     } catch (err) {
       rejected.push({
         name,
