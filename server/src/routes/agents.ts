@@ -518,8 +518,29 @@ export function agentRoutes(
       buildAgentAccessState(agent),
     ]);
 
+    if (options?.restricted) {
+      return {
+        ...redactForRestrictedAgentView(agent),
+        chainOfCommand,
+        access: accessState,
+      };
+    }
+
+    // ROC-52: even in the unrestricted (operator with config:read) view,
+    // adapterConfig.env / runtimeConfig.env values must be redacted in
+    // the API response. The operator already has DB access if they need
+    // the raw values; the API response gets pulled into board UIs,
+    // copied into chat, logged by monitors, etc. — none of which should
+    // see raw API tokens. Pairs with the redaction.ts ENV_BAG_KEY_RE
+    // gate that treats env values as sensitive regardless of var name.
     return {
-      ...(options?.restricted ? redactForRestrictedAgentView(agent) : agent),
+      ...agent,
+      adapterConfig: redactEventPayload(
+        agent.adapterConfig as Record<string, unknown> | null,
+      ),
+      runtimeConfig: redactEventPayload(
+        agent.runtimeConfig as Record<string, unknown> | null,
+      ),
       chainOfCommand,
       access: accessState,
     };
