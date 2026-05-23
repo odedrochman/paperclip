@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { REDACTED_EVENT_VALUE, redactEventPayload, redactSensitiveText, sanitizeRecord } from "../redaction.js";
 
 describe("redaction", () => {
-  it("redacts sensitive keys and nested secret values", () => {
+  it("redacts sensitive keys and nested secret values; ROC-52 Option A — env is a sensitive bag", () => {
     const input = {
       apiKey: "abc123",
       nested: {
@@ -19,6 +19,11 @@ describe("redaction", () => {
           type: "plain",
           value: "sk-plain",
         },
+        // ROC-52: PAPERCLIP_API_URL would previously have passed
+        // through because its key name doesn't match SECRET_PAYLOAD_KEY_RE.
+        // Under Option A all plain values under `env` are now redacted
+        // regardless of the var name, because non-secret config should
+        // not live in env in the first place.
         PAPERCLIP_API_URL: "http://localhost:3100",
       },
     };
@@ -40,7 +45,61 @@ describe("redaction", () => {
         type: "plain",
         value: REDACTED_EVENT_VALUE,
       },
-      PAPERCLIP_API_URL: "http://localhost:3100",
+      // ROC-52 Option A: now redacted (was previously plain).
+      PAPERCLIP_API_URL: REDACTED_EVENT_VALUE,
+    });
+  });
+
+  it("ROC-52 Option A: redacts env vars with non-standard key names (NOTION_INTEGRATION, CUSTOM_CRED, etc.)", () => {
+    const input = {
+      env: {
+        NOTION_INTEGRATION: "secret-integration-token",
+        MY_ORG_TOKEN: "another-secret-value",
+        CUSTOM_CRED: "yet-another",
+        // Even seemingly benign string values get redacted under Option A
+        // because env is treated as a secret bag.
+        BASE_URL: "https://api.example.com",
+      },
+    };
+
+    const result = sanitizeRecord(input);
+    expect(result.env).toEqual({
+      NOTION_INTEGRATION: REDACTED_EVENT_VALUE,
+      MY_ORG_TOKEN: REDACTED_EVENT_VALUE,
+      CUSTOM_CRED: REDACTED_EVENT_VALUE,
+      BASE_URL: REDACTED_EVENT_VALUE,
+    });
+  });
+
+  it("ROC-52 Option A: secret_ref bindings in env still pass through with the secretId intact", () => {
+    const input = {
+      env: {
+        OPENAI_API_KEY: {
+          type: "secret_ref",
+          secretId: "22222222-2222-2222-2222-222222222222",
+          version: 3,
+        },
+        ANTHROPIC_API_KEY: {
+          type: "secret_ref",
+          secretId: "33333333-3333-3333-3333-333333333333",
+        },
+        // null preserved for shape inspection
+        EMPTY_VAR: null,
+      },
+    };
+
+    const result = sanitizeRecord(input);
+    expect(result.env).toEqual({
+      OPENAI_API_KEY: {
+        type: "secret_ref",
+        secretId: "22222222-2222-2222-2222-222222222222",
+        version: 3,
+      },
+      ANTHROPIC_API_KEY: {
+        type: "secret_ref",
+        secretId: "33333333-3333-3333-3333-333333333333",
+      },
+      EMPTY_VAR: null,
     });
   });
 
@@ -107,10 +166,15 @@ describe("redaction", () => {
       REDACTED_EVENT_VALUE,
       `--api-key=${REDACTED_EVENT_VALUE}`,
     ]);
+    // ROC-52 Option A: env is a sensitive bag. Both PAPERCLIP_RESOLVED_COMMAND
+    // and SAFE_VALUE now fully redact instead of partial-redact or pass-through.
+    // The outer `command` / `commandArgs` paths above still apply their own
+    // text/arg redaction because those keys are at the top level, not inside env.
+    // If command-line observability is needed for an agent, move that field
+    // out of the env block in the payload.
     expect(result?.env).toEqual({
-      PAPERCLIP_RESOLVED_COMMAND:
-        `env OPENAI_API_KEY=${REDACTED_EVENT_VALUE} custom-acp --token ${REDACTED_EVENT_VALUE}`,
-      SAFE_VALUE: "visible",
+      PAPERCLIP_RESOLVED_COMMAND: REDACTED_EVENT_VALUE,
+      SAFE_VALUE: REDACTED_EVENT_VALUE,
     });
   });
 
