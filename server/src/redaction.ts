@@ -2,6 +2,13 @@ import { redactCommandText } from "@paperclipai/adapter-utils";
 
 const SECRET_PAYLOAD_KEY_RE =
   /(api[-_]?key|access[-_]?token|auth(?:_?token)?|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)/i;
+// ROC-52 Option A: the `env` block of an adapterConfig (or any payload)
+// is treated as sensitive by default — plain string and plain-binding
+// values are redacted regardless of key name. Only `secret_ref`
+// bindings (which carry only a UUID, no value) pass through. Operator
+// originally surfaced this as a leak risk for non-standard key names
+// like NOTION_INTEGRATION or CUSTOM_CRED.
+const ENV_BAG_KEY_RE = /^env$/i;
 const COMMAND_PAYLOAD_KEY_RE =
   /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
 const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
@@ -55,6 +62,31 @@ function sanitizeCommandArgs(args: unknown[]): unknown[] {
   });
 }
 
+// ROC-52 Option A: every value under `env` is treated as sensitive by
+// default. Plain bindings and bare strings get redacted regardless of
+// the env var's name; only `secret_ref` bindings (which contain just a
+// secretId reference, no value) pass through. Nulls preserved so the
+// shape stays inspectable.
+function sanitizeEnvBag(env: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [varName, varValue] of Object.entries(env)) {
+    if (varValue === null || varValue === undefined) {
+      out[varName] = varValue;
+      continue;
+    }
+    if (isSecretRefBinding(varValue)) {
+      out[varName] = varValue;
+      continue;
+    }
+    if (isPlainBinding(varValue)) {
+      out[varName] = { type: "plain", value: REDACTED_EVENT_VALUE };
+      continue;
+    }
+    out[varName] = REDACTED_EVENT_VALUE;
+  }
+  return out;
+}
+
 export function sanitizeRecord(record: Record<string, unknown>): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
@@ -64,6 +96,13 @@ export function sanitizeRecord(record: Record<string, unknown>): Record<string, 
     }
     if (COMMAND_PAYLOAD_KEY_RE.test(key) && typeof value === "string") {
       redacted[key] = redactSensitiveText(value);
+      continue;
+    }
+    // ROC-52 Option A: treat `env` as a sensitive bag — redact ALL
+    // plain values regardless of the var name. Non-secret config
+    // should live in other adapterConfig keys, not in env.
+    if (ENV_BAG_KEY_RE.test(key) && isPlainObject(value)) {
+      redacted[key] = sanitizeEnvBag(value);
       continue;
     }
     if (SECRET_PAYLOAD_KEY_RE.test(key)) {
