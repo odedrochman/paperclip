@@ -6922,7 +6922,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         }
         if (uploadClient) {
-          const agentHomeDir = resolveDefaultAgentWorkspaceDir(args.agent.id);
+          // Task 2.4b -- read artifacts from the per-run sandbox dir,
+          // which is the worker's `$AGENT_HOME` (set by
+          // `buildGuildWorkerEnv`). This aligns the upload hook with
+          // both the sandbox prep step (which created
+          // `<sandboxDir>/artifacts/out/`) and the worker (which
+          // writes to `$AGENT_HOME/artifacts/out/`). The earlier
+          // implementation used `resolveDefaultAgentWorkspaceDir(agent.id)`
+          // here, but workers never wrote there, so the hook always
+          // found nothing. `args.guildSandboxDir` is guaranteed
+          // non-null at this point by the early-return guard above.
+          const agentHomeDir = args.guildSandboxDir;
           videoArtifactsUploaded = await uploadWorkerArtifacts({
             agentHomeDir,
             requestId: uploadRequestId,

@@ -63,7 +63,8 @@ export interface BuildGuildWorkerEnvInput {
   /**
    * Title of the issue the worker is being dispatched for, if any.
    * When the title matches `video-<stage>/<request_id>` the helper
-   * additionally emits VIDEO_AD_STAGE + VIDEO_AD_REQUEST_ID.
+   * additionally emits VIDEO_AD_STAGE + VIDEO_AD_REQUEST_ID +
+   * VIDEO_AD_ARTIFACTS_DIR.
    */
   issueTitle?: string | null;
 }
@@ -71,6 +72,23 @@ export interface BuildGuildWorkerEnvInput {
 /**
  * Returns the env-var map for a guild worker spawn. For non-guild
  * agents returns {} so callers can spread unconditionally.
+ *
+ * Task 2.4b -- artifact contract env vars:
+ *
+ *   - `AGENT_HOME` = sandboxDir, emitted for every guild worker. This
+ *     is the canonical "home" the worker reads/writes under. The
+ *     dispatcher pre-creates `<sandboxDir>/artifacts/in/` and
+ *     `<sandboxDir>/artifacts/out/` (see `prepareGuildRunSandbox`),
+ *     and the worker-exit upload hook in heartbeat.ts reads from
+ *     `<sandboxDir>/artifacts/out/`. Aligning all three on the
+ *     per-run sandbox dir closes the contract gap where the worker
+ *     would otherwise invent a random `/tmp/...` path and the upload
+ *     hook would find nothing.
+ *
+ *   - `VIDEO_AD_ARTIFACTS_DIR` = `<sandboxDir>/artifacts`, emitted
+ *     only when `issueTitle` matches `video-<stage>/<request_id>`.
+ *     Workers in video-guild use this to scope artifact reads/writes
+ *     to the per-request-id sandbox.
  */
 export function buildGuildWorkerEnv(
   input: BuildGuildWorkerEnvInput,
@@ -84,12 +102,14 @@ export function buildGuildWorkerEnv(
     GUILD_SKILLS_PATH: path.join(sandboxDir, GUILD_WORKER_SKILLS_FILE),
     WORKER_LEARNINGS_PATH: path.join(sandboxDir, GUILD_WORKER_LEARNINGS_FILE),
     MEMORY_SERVICE_PROJECT: `${GUILD_MEMORY_PROJECT_PREFIX}/${agent.name}`,
+    AGENT_HOME: sandboxDir,
   };
   if (typeof issueTitle === "string") {
     const match = issueTitle.match(VIDEO_ISSUE_TITLE_PATTERN);
     if (match) {
       env.VIDEO_AD_STAGE = match[1];
       env.VIDEO_AD_REQUEST_ID = match[2];
+      env.VIDEO_AD_ARTIFACTS_DIR = path.join(sandboxDir, "artifacts");
     }
   }
   return env;
