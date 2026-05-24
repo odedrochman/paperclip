@@ -72,6 +72,12 @@ import {
   parseVideoStageCompletedEvent,
   type IngestGuildLearningsResult,
 } from "../dispatch/ingest-guild-learnings.js";
+import {
+  httpArtifactUploadClient,
+  type ArtifactUploadClient,
+} from "../dispatch/artifacts-client.js";
+import { uploadWorkerArtifacts } from "../dispatch/upload-worker-artifacts.js";
+import { VIDEO_ISSUE_TITLE_PATTERN } from "../dispatch/guild-worker-env.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
@@ -6817,6 +6823,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
      * (succeeded|failed|cancelled|timed_out). Only 'succeeded' triggers
      * the video.stage.completed emit; the path is otherwise a no-op. */
     runStatus?: string;
+    /**
+     * Phase 3.5 Step 2: optional upload client injection seam. When
+     * provided, the hook uses it to push completed artifact files from
+     * the agent's home directory to agent-fs after a successful
+     * video-stage run. Production code constructs from
+     * `process.env.AGENT_FS_URL` / `AGENT_FS_TOKEN` when omitted and
+     * both env vars are set. Tests inject a fake to avoid real HTTP.
+     */
+    artifactUploadClient?: ArtifactUploadClient | null;
   }): Promise<{
     resultJson: Record<string, unknown> | null;
     cleanedSandbox: boolean;
@@ -6872,6 +6887,96 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         "guild dispatch: learnings.json top-level error; no ingest",
       );
     }
+    // Phase 3.5 Step 2: upload worker artifact files to agent-fs after
+    // a successful video-stage run. Runs BEFORE sandbox cleanup so the
+    // artifact files are still present. Wrapped in try/catch as defense-
+    // in-depth; per-file failures are caught inside uploadWorkerArtifacts.
+    let videoArtifactsUploaded: {
+      uploaded: string[];
+      failed: Array<{ filename: string; reason: string }>;
+      skipped: { reason: "no-artifacts-dir" } | null;
+    } | null = null;
+    try {
+      const videoTitleMatch =
+        typeof args.issueTitle === "string"
+          ? args.issueTitle.match(VIDEO_ISSUE_TITLE_PATTERN)
+          : null;
+      if (videoTitleMatch && args.runStatus === "succeeded") {
+        const uploadStage = videoTitleMatch[1];
+        const uploadRequestId = videoTitleMatch[2];
+        // Resolve upload client: prefer injected (tests / operator
+        // override), fall back to constructing from env vars.
+        let uploadClient: ArtifactUploadClient | null =
+          args.artifactUploadClient ?? null;
+        if (!uploadClient) {
+          const fsUrl = process.env.AGENT_FS_URL?.trim();
+          const fsToken = process.env.AGENT_FS_TOKEN?.trim();
+          if (fsUrl && fsToken) {
+            uploadClient = httpArtifactUploadClient({ url: fsUrl, token: fsToken });
+          } else {
+            logger.warn(
+              { runId: args.run.id, agentId: args.agent.id, stage: uploadStage, requestId: uploadRequestId },
+              "video-guild artifact upload: AGENT_FS_URL / AGENT_FS_TOKEN not set; skipping artifact upload",
+            );
+          }
+        }
+        if (uploadClient) {
+          const agentHomeDir = resolveDefaultAgentWorkspaceDir(args.agent.id);
+          videoArtifactsUploaded = await uploadWorkerArtifacts({
+            agentHomeDir,
+            requestId: uploadRequestId,
+            stage: uploadStage,
+            uploadClient,
+            logger,
+          });
+          if (videoArtifactsUploaded.failed.length > 0) {
+            logger.warn(
+              {
+                runId: args.run.id,
+                agentId: args.agent.id,
+                stage: uploadStage,
+                requestId: uploadRequestId,
+                failed: videoArtifactsUploaded.failed,
+              },
+              "video-guild artifact upload: some files failed to upload",
+            );
+          }
+          // Emit activity_log row so ceo-chat dispatcher can discover
+          // which artifacts are ready to fetch (Step 3).
+          // Wrapped in try/catch -- observability never blocks the run.
+          try {
+            await logActivity(db, {
+              companyId: args.agent.companyId,
+              actorType: "agent",
+              actorId: args.agent.id,
+              action: "video.artifacts.uploaded",
+              entityType: "heartbeat_run",
+              entityId: args.run.id,
+              agentId: args.agent.id,
+              runId: args.run.id,
+              details: {
+                request_id: uploadRequestId,
+                stage: uploadStage,
+                uploaded: videoArtifactsUploaded.uploaded,
+                failed: videoArtifactsUploaded.failed,
+                run_id: args.run.id,
+                agent_id: args.agent.id,
+              },
+            });
+          } catch (activityErr) {
+            logger.warn(
+              { err: activityErr, runId: args.run.id, agentId: args.agent.id },
+              "video-guild artifact upload: failed to write activity_log(video.artifacts.uploaded)",
+            );
+          }
+        }
+      }
+    } catch (uploadErr) {
+      logger.warn(
+        { err: uploadErr, runId: args.run.id, agentId: args.agent.id },
+        "video-guild artifact upload: unexpected error in upload step; continuing",
+      );
+    }
     const cleanup = await cleanupGuildRunSandbox(sandboxDir);
     if (cleanup.warning) {
       logger.warn(
@@ -6901,6 +7006,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ...(ingest.recordedUseRejected.length > 0
         ? { recordedUseRejected: ingest.recordedUseRejected }
         : {}),
+      // Phase 3.5 Step 2: artifact upload summary (null when not a
+      // video-stage run or when run did not succeed).
+      ...(videoArtifactsUploaded !== null ? { videoArtifactsUploaded } : {}),
     };
     // Plan 3 Phase E3: post-hook telemetry. activity_log row is
     // persistent + plugin-bus-published (action is in PLUGIN_EVENT_SET).
@@ -8107,7 +8215,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // non-guild agents buildGuildWorkerEnv returns {}, so the
       // composition is identical to the pre-Phase-E behaviour.
       const guildEnv = guildSandboxDir
-        ? buildGuildWorkerEnv({ agent, sandboxDir: guildSandboxDir })
+        ? buildGuildWorkerEnv({
+            agent,
+            sandboxDir: guildSandboxDir,
+            // Phase 3.5 Step 2 bug fix: pass the issue title so
+            // buildGuildWorkerEnv can emit VIDEO_AD_STAGE +
+            // VIDEO_AD_REQUEST_ID for video-stage workers. Without this,
+            // workers could not construct artifact paths correctly.
+            issueTitle: issueContext?.title ?? null,
+          })
         : {};
       const wrappedAgent = {
         ...agent,

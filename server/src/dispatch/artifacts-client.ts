@@ -72,3 +72,105 @@ export function httpArtifactsClient(env: HttpArtifactsClientEnv): ArtifactsClien
     },
   };
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3.5 Step 2 -- upload side (worker exit-hook artifact uploader).
+//
+// Mirrors the read-side `ArtifactsClient` but for the worker exit hook that
+// pushes completed artifact files from the agent's home directory back into
+// agent-fs after a successful video-stage run.
+//
+// Routing convention (matches the Step 1 agent-fs routes):
+//   .json files  -> JSON PUT  /artifacts/<req>/<stage>/<filename>
+//   everything else -> binary PUT /artifacts/<req>/<stage>/<filename>/binary
+// ---------------------------------------------------------------------------
+
+/**
+ * Upload-side counterpart to `ArtifactsClient`. Called by the worker
+ * exit hook to push artifact files from the agent's home directory into
+ * agent-fs after a successful video-stage run.
+ *
+ * Throws on transport errors or non-2xx responses; callers are expected
+ * to catch per-file and continue (warn-log-continue pattern).
+ */
+export interface ArtifactUploadClient {
+  /**
+   * Upload one artifact file to agent-fs. The implementation routes
+   * `.json` filenames via the JSON PUT route and everything else via
+   * the binary PUT route. Throws on transport or HTTP non-2xx failures;
+   * the caller wraps each call in its own try/catch (warn-log-continue).
+   */
+  uploadArtifact(
+    requestId: string,
+    stage: string,
+    filename: string,
+    body: Buffer,
+  ): Promise<void>;
+}
+
+export interface HttpArtifactUploadClientEnv {
+  /** Base URL for agent-fs, e.g. `http://agent-fs:8080`. No trailing slash. */
+  url: string;
+  /** Bearer token for the dispatcher's agent-fs credentials. */
+  token: string;
+}
+
+/**
+ * Production implementation. Routes `.json` filenames to the JSON PUT
+ * route and all other filenames to the binary PUT route added in
+ * Step 1 (`/artifacts/:req/:stage/:filename/binary`).
+ *
+ * Non-2xx responses throw with HTTP status + URL in the message. Network
+ * errors propagate naturally. Both are caught by the caller's per-file
+ * try/catch.
+ */
+export function httpArtifactUploadClient(
+  env: HttpArtifactUploadClientEnv,
+): ArtifactUploadClient {
+  const base = env.url.replace(/\/+$/, "");
+  return {
+    async uploadArtifact(
+      requestId: string,
+      stage: string,
+      filename: string,
+      body: Buffer,
+    ): Promise<void> {
+      const isJson = filename.endsWith(".json");
+      const encodedPath = `${encodeURIComponent(requestId)}/${encodeURIComponent(stage)}/${encodeURIComponent(filename)}`;
+      const url = isJson
+        ? `${base}/artifacts/${encodedPath}`
+        : `${base}/artifacts/${encodedPath}/binary`;
+
+      let res: Response;
+      if (isJson) {
+        // Parse and re-serialise so the agent-fs JSON route receives a
+        // well-formed JSON body via its `c.req.json()` call.
+        const parsed: unknown = JSON.parse(body.toString("utf-8"));
+        res = await fetch(url, {
+          method: "PUT",
+          headers: {
+            Authorization: `Bearer ${env.token}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(parsed),
+        });
+      } else {
+        // Convert Buffer to Uint8Array so the fetch BodyInit type is
+        // satisfied (Buffer extends Uint8Array but TypeScript's fetch
+        // overloads do not widen to Buffer directly).
+        res = await fetch(url, {
+          method: "PUT",
+          headers: {
+            Authorization: `Bearer ${env.token}`,
+            "Content-Type": "application/octet-stream",
+          },
+          body: new Uint8Array(body),
+        });
+      }
+
+      if (!res.ok) {
+        throw new Error(`agent-fs returned ${res.status} for PUT ${url}`);
+      }
+    },
+  };
+}
