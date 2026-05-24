@@ -45,9 +45,12 @@ export interface HttpArtifactsClientEnv {
 
 /**
  * Production implementation. Wraps `fetch` against the agent-fs
- * Task 2.3 route. Non-200 responses resolve to `null` (the dispatcher
- * surfaces this as a non-fatal warning); network errors propagate so
- * the dispatcher fails-fast on outright agent-fs unavailability.
+ * Task 2.3 route. A 404 resolves to `null` (artifact truly missing;
+ * the dispatcher surfaces this as a soft degraded-path warning). Any
+ * other non-2xx (401, 403, 5xx, etc.) throws with status + URL in the
+ * message so the dispatcher's try/catch surfaces it as a louder
+ * operational warning rather than silently degrading. Network errors
+ * propagate naturally for the same reason.
  */
 export function httpArtifactsClient(env: HttpArtifactsClientEnv): ArtifactsClient {
   const base = env.url.replace(/\/+$/, "");
@@ -61,7 +64,10 @@ export function httpArtifactsClient(env: HttpArtifactsClientEnv): ArtifactsClien
       const res = await fetch(url, {
         headers: { Authorization: `Bearer ${env.token}` },
       });
-      if (!res.ok) return null;
+      if (res.status === 404) return null;
+      if (!res.ok) {
+        throw new Error(`agent-fs returned ${res.status} for ${url}`);
+      }
       return (await res.json()) as unknown;
     },
   };

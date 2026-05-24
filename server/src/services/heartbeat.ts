@@ -7990,12 +7990,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             "guild dispatch: canonical-skills snapshot query failed; dispatching with empty snapshot",
           );
         }
-        // TODO: Task 2.4b wire ArtifactsClient through heartbeat dispatch path.
-        // When the issue title matches `video-<stage>/<request_id>`, build a
-        // real httpArtifactsClient(AGENT_FS_URL, AGENT_FS_TOKEN) and pass it
-        // here as `videoContext` so prior-stage artifacts get mirrored into
-        // the sandbox. Skipped in 2.4 because env-var ingest needs its own
-        // design pass.
+        // TODO: Task 2.4b -- wire ArtifactsClient through heartbeat dispatch path.
+        //   Reuse VIDEO_ISSUE_TITLE_PATTERN from dispatch/guild-worker-env.ts to
+        //   parse the issue title into { stage, requestId }; build
+        //   httpArtifactsClient({ url: env.AGENT_FS_URL, token: env.AGENT_FS_TOKEN })
+        //   and pass it here as `videoContext.artifacts` so prior-stage
+        //   artifacts get mirrored into the sandbox. Skipped in 2.4 because
+        //   env-var ingest needs its own design pass.
+        //   See docs/superpowers/plans/2026-05-23-video-guild-implementation.md
+        //   Task 2.4 section for context.
         const prep = await prepareGuildRunSandbox({
           runId: run.id,
           guildId: agent.id,

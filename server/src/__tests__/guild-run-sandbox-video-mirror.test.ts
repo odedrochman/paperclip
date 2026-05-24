@@ -33,7 +33,10 @@ import { prepareGuildRunSandbox } from "../dispatch/guild-run-sandbox.js";
 
 class FakeArtifactsClient implements ArtifactsClient {
   public readonly calls: Array<{ requestId: string; stage: string; filename: string }> = [];
-  constructor(private readonly responses: Map<string, unknown | null>) {}
+  constructor(
+    private readonly responses: Map<string, unknown | null>,
+    private readonly throwFor: Map<string, Error> = new Map(),
+  ) {}
   async fetchArtifact(
     requestId: string,
     stage: string,
@@ -41,6 +44,9 @@ class FakeArtifactsClient implements ArtifactsClient {
   ): Promise<unknown | null> {
     this.calls.push({ requestId, stage, filename });
     const key = `${stage}/${filename}`;
+    if (this.throwFor.has(key)) {
+      throw this.throwFor.get(key)!;
+    }
     if (!this.responses.has(key)) return null;
     return this.responses.get(key) ?? null;
   }
@@ -257,6 +263,43 @@ describe("prepareGuildRunSandbox video-context mirror (Phase 2 Task 2.4)", () =>
     // sandbox dir was still created and available_skills.json still written
     await expect(fs.access(result.availableSkillsPath)).resolves.not.toThrow();
     // the file was NOT created because the artifact was null
+    await expect(
+      fs.access(
+        path.join(result.sandboxDir, "artifacts", "in", "research", "research-bundle.json"),
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("client throw is non-fatal: warning includes error message, sandbox still usable", async () => {
+    // strategy stage expects research-bundle.json; client throws (e.g. agent-fs 401).
+    const client = new FakeArtifactsClient(
+      new Map(),
+      new Map([
+        ["research/research-bundle.json", new Error("agent-fs returned 401 for http://agent-fs/x")],
+      ]),
+    );
+    const result = await prepareGuildRunSandbox({
+      runId: "aaaaaaaa-aaaa-aaaa-aaaa-000000000007",
+      guildId: "g1",
+      guildSlug: "video-guild",
+      guildInstructionsRoot: bundleRoot,
+      skills: [],
+      tmpDirOverride: testTmpRoot,
+      videoContext: {
+        requestId: "req-7",
+        stage: "strategy",
+        artifacts: client,
+      },
+    });
+    createdSandboxes.push(result.sandboxDir);
+
+    expect(result.mirroredArtifacts).toEqual([]);
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0]).toMatch(/research-bundle\.json/);
+    expect(result.warnings[0]).toMatch(/401/);
+    // sandbox dir was still created and available_skills.json still written
+    await expect(fs.access(result.availableSkillsPath)).resolves.not.toThrow();
+    // no artifact file written for the throwing path
     await expect(
       fs.access(
         path.join(result.sandboxDir, "artifacts", "in", "research", "research-bundle.json"),
