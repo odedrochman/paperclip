@@ -134,20 +134,27 @@ export interface PrepareGuildRunSandboxResult {
 
 /**
  * Build a per-run sandbox dir, populate it with the guild's autonomy
- * envelope + canonical-skills snapshot, and (for video-guild runs)
+ * envelope + canonical-skills snapshot, pre-create the
+ * `<sandboxDir>/artifacts/{in,out}/` tree, and (for video-guild runs)
  * mirror prior-stage JSON artifacts into
  * `<sandboxDir>/artifacts/in/<stage>/<filename>`.
  *
  * Design notes:
  *
- *   - Video artifacts live under the per-run sandbox dir, not under
- *     `$AGENT_HOME/artifacts/in/`. The plan literal says $AGENT_HOME
- *     but the dispatcher creates per-run tmp dirs and video artifacts
- *     are per-request-id scoped, so the per-run sandbox is the right
- *     home. The worker reads its artifacts via the env vars the
- *     sibling `buildGuildWorkerEnv` emits (Task 2.4b will surface a
- *     `VIDEO_AD_ARTIFACTS_DIR` env var; for now workers can derive it
- *     from `GUILD_AUTONOMY_JSON_PATH`'s dir).
+ *   - The per-run sandbox dir is the worker's `$AGENT_HOME` (Task
+ *     2.4b). `buildGuildWorkerEnv` emits `AGENT_HOME = sandboxDir`
+ *     for every guild worker and `VIDEO_AD_ARTIFACTS_DIR =
+ *     <sandboxDir>/artifacts` for video-stage issues. The
+ *     worker-exit upload hook in `heartbeat.ts` reads completed
+ *     artifacts from `<sandboxDir>/artifacts/out/`, closing the loop
+ *     so all three layers (sandbox prep, worker, upload hook) agree
+ *     on a single home.
+ *
+ *   - `artifacts/in/` and `artifacts/out/` are always pre-created as
+ *     empty dirs at sandbox prep time, regardless of guild type or
+ *     stage. This lets every worker (eng-guild, video-guild, future
+ *     guilds) reliably `cd $AGENT_HOME/artifacts/out` to drop
+ *     outputs without first running `mkdir -p`.
  *
  *   - v0 is JSON-only by design (matches Task 2.3's agent-fs route).
  *     Text/binary artifacts like captions.srt or render.mp4 are
@@ -178,6 +185,15 @@ export async function prepareGuildRunSandbox(
     JSON.stringify(skillsSnapshot, null, 2),
     "utf-8",
   );
+
+  // Task 2.4b -- pre-create `artifacts/in/` and `artifacts/out/` as
+  // empty dirs for every guild run. Workers read prior-stage inputs
+  // from `artifacts/in/` and write completed outputs to `artifacts/out/`;
+  // the worker-exit upload hook in heartbeat.ts reads from the same
+  // `artifacts/out/`. Creating these unconditionally keeps the contract
+  // identical across guild types and stages.
+  await fs.mkdir(path.join(sandboxDir, "artifacts", "in"), { recursive: true, mode: 0o700 });
+  await fs.mkdir(path.join(sandboxDir, "artifacts", "out"), { recursive: true, mode: 0o700 });
 
   // autonomy.json — copied from the deployed bundle if present.
   let autonomyJsonPath: string | null = null;
