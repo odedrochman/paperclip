@@ -26,6 +26,7 @@
  * See docs/superpowers/specs/2026-05-21-plan3-phase-e-worker-lifecycle.md
  * decisions D4, D7, D8.
  */
+import fs from "node:fs";
 import path from "node:path";
 
 import { agents } from "@paperclipai/db";
@@ -35,6 +36,34 @@ type AgentRow = typeof agents.$inferSelect;
 export const GUILD_WORKER_LEARNINGS_FILE = "learnings.json";
 export const GUILD_WORKER_SKILLS_FILE = "available_skills.json";
 export const GUILD_WORKER_AUTONOMY_FILE = "autonomy.json";
+
+/**
+ * Tier 3 Phase 1 Task 2 -- operator UGC upload convention.
+ *
+ * Operators drop video clips (`.mp4`) for a video-ad request into
+ * `/paperclip/operator-uploads/<request_id>/` on the host. The paperclip
+ * container sees the same path because the host bind-mounts the
+ * paperclip-data volume.
+ *
+ * The root is resolved lazily inside `buildGuildWorkerEnv` so tests can
+ * override it via `PAPERCLIP_OPERATOR_UPLOADS_ROOT` per-call with
+ * `vi.stubEnv` without re-importing the module.
+ */
+export const OPERATOR_UPLOADS_ROOT = "/paperclip/operator-uploads";
+
+function resolveOperatorUploadsRoot(): string {
+  const override = process.env.PAPERCLIP_OPERATOR_UPLOADS_ROOT;
+  if (override !== undefined && override !== "") return override;
+  return OPERATOR_UPLOADS_ROOT;
+}
+
+/**
+ * Defense-in-depth validation for a video-ad `request_id`. The
+ * `VIDEO_ISSUE_TITLE_PATTERN` regex already prevents slashes in the
+ * captured group, but we re-check before composing a filesystem path
+ * so a future regex tweak cannot accidentally introduce traversal.
+ */
+const REQUEST_ID_SAFE_PATTERN = /^[a-zA-Z0-9_.\-]+$/;
 
 /**
  * Third-party API keys forwarded from process.env to video-guild
@@ -131,6 +160,54 @@ export function buildGuildWorkerEnv(
         if (value !== undefined && value !== "") {
           env[key] = value;
         }
+      }
+      /**
+       * Tier 3 Phase 1 Task 2 -- operator UGC clip detection.
+       *
+       * Convention: operator drops `.mp4` clips into
+       * `${OPERATOR_UPLOADS_ROOT}/<request_id>/` on the host. When such
+       * a directory exists and contains >=1 `.mp4` file we surface its
+       * path + count to the worker via UGC_INPUT_DIR + UGC_INPUT_COUNT.
+       *
+       * The worker reads UGC_INPUT_DIR as the B.1 trigger: if set, mix
+       * operator clips into the edit; if absent, the worker falls back
+       * to the B.2 path (synthetic clips). Skip emission when:
+       *   - the request_id fails the safe-name check (defense in depth
+       *     against path traversal beyond the regex)
+       *   - the dir does not exist
+       *   - the dir exists but contains zero `.mp4` files
+       *   - readdir fails (e.g. EACCES) -- warn and skip
+       * Symlinks inside the dir are not followed; we count entries
+       * named `*.mp4` regardless of type.
+       */
+      const requestId = match[2];
+      if (REQUEST_ID_SAFE_PATTERN.test(requestId)) {
+        const uploadsDir = path.join(resolveOperatorUploadsRoot(), requestId);
+        const stat = fs.statSync(uploadsDir, { throwIfNoEntry: false });
+        if (stat && stat.isDirectory()) {
+          let mp4Count = 0;
+          try {
+            const entries = fs.readdirSync(uploadsDir);
+            for (const entry of entries) {
+              if (entry.toLowerCase().endsWith(".mp4")) {
+                mp4Count += 1;
+              }
+            }
+          } catch (err) {
+            console.warn(
+              `[guild-worker-env] readdir failed for ${uploadsDir}; skipping UGC env emission: ${(err as Error).message}`,
+            );
+            mp4Count = 0;
+          }
+          if (mp4Count > 0) {
+            env.UGC_INPUT_DIR = uploadsDir;
+            env.UGC_INPUT_COUNT = String(mp4Count);
+          }
+        }
+      } else {
+        console.warn(
+          `[guild-worker-env] request_id ${JSON.stringify(requestId)} failed safe-name check; skipping UGC env emission`,
+        );
       }
     }
   }

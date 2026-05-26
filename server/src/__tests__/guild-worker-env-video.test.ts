@@ -12,9 +12,11 @@
  * function's actual signature per the TDD rule "adapt the test, not
  * the function".
  */
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { buildGuildWorkerEnv } from "../dispatch/guild-worker-env.js";
 
@@ -232,6 +234,164 @@ describe("video-guild worker env", () => {
         issueTitle: "video-research/abc-123",
       });
       expect(env.ELEVENLABS_API_KEY).toBeUndefined();
+    });
+  });
+
+  /**
+   * Tier 3 Phase 1 Task 2 -- operator UGC clip detection.
+   *
+   * When the operator drops `.mp4` clips into
+   * `${PAPERCLIP_OPERATOR_UPLOADS_ROOT}/<request_id>/`, the dispatcher
+   * surfaces UGC_INPUT_DIR + UGC_INPUT_COUNT to the worker. Absence of
+   * UGC_INPUT_DIR is the worker's signal to take the synthetic-clip
+   * fallback path (B.2). Tests redirect the root to a tmpdir.
+   */
+  describe("UGC_INPUT_DIR + UGC_INPUT_COUNT (Tier 3 Phase 1 Task 2)", () => {
+    let tmpRoot: string;
+
+    beforeEach(() => {
+      tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "operator-uploads-"));
+      vi.stubEnv("PAPERCLIP_OPERATOR_UPLOADS_ROOT", tmpRoot);
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+      try {
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+      } catch {
+        // best-effort cleanup
+      }
+    });
+
+    it("does NOT emit UGC_INPUT_DIR when the operator-uploads dir does not exist", () => {
+      // tmpRoot exists but has no subdir for the request_id
+      const env = buildGuildWorkerEnv({
+        agent: guildAgent,
+        sandboxDir,
+        issueTitle: "video-edit/req-missing",
+      });
+      expect(env.UGC_INPUT_DIR).toBeUndefined();
+      expect(env.UGC_INPUT_COUNT).toBeUndefined();
+    });
+
+    it("does NOT emit UGC_INPUT_DIR when the dir exists but is empty", () => {
+      fs.mkdirSync(path.join(tmpRoot, "req-empty"));
+      const env = buildGuildWorkerEnv({
+        agent: guildAgent,
+        sandboxDir,
+        issueTitle: "video-edit/req-empty",
+      });
+      expect(env.UGC_INPUT_DIR).toBeUndefined();
+      expect(env.UGC_INPUT_COUNT).toBeUndefined();
+    });
+
+    it("does NOT emit UGC_INPUT_DIR when the dir contains only non-mp4 files", () => {
+      const dir = path.join(tmpRoot, "req-only-txt");
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, "notes.txt"), "hello");
+      fs.writeFileSync(path.join(dir, "thumb.png"), "");
+      const env = buildGuildWorkerEnv({
+        agent: guildAgent,
+        sandboxDir,
+        issueTitle: "video-edit/req-only-txt",
+      });
+      expect(env.UGC_INPUT_DIR).toBeUndefined();
+      expect(env.UGC_INPUT_COUNT).toBeUndefined();
+    });
+
+    it("emits UGC_INPUT_DIR + UGC_INPUT_COUNT='1' when the dir contains a single .mp4", () => {
+      const requestId = "req-single";
+      const dir = path.join(tmpRoot, requestId);
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, "hook.mp4"), "");
+      const env = buildGuildWorkerEnv({
+        agent: guildAgent,
+        sandboxDir,
+        issueTitle: `video-edit/${requestId}`,
+      });
+      expect(env.UGC_INPUT_DIR).toBe(dir);
+      expect(env.UGC_INPUT_COUNT).toBe("1");
+    });
+
+    it("counts only .mp4 files; UGC_INPUT_COUNT='3' when dir has 3 mp4 + 1 txt", () => {
+      const requestId = "req-mixed";
+      const dir = path.join(tmpRoot, requestId);
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, "hook.mp4"), "");
+      fs.writeFileSync(path.join(dir, "reaction.mp4"), "");
+      fs.writeFileSync(path.join(dir, "outro.mp4"), "");
+      fs.writeFileSync(path.join(dir, "notes.txt"), "operator notes");
+      const env = buildGuildWorkerEnv({
+        agent: guildAgent,
+        sandboxDir,
+        issueTitle: `video-edit/${requestId}`,
+      });
+      expect(env.UGC_INPUT_DIR).toBe(dir);
+      expect(env.UGC_INPUT_COUNT).toBe("3");
+    });
+
+    it("treats .MP4 (uppercase) as an mp4 (case-insensitive match)", () => {
+      const requestId = "req-upper";
+      const dir = path.join(tmpRoot, requestId);
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, "CLIP1.MP4"), "");
+      fs.writeFileSync(path.join(dir, "clip2.Mp4"), "");
+      const env = buildGuildWorkerEnv({
+        agent: guildAgent,
+        sandboxDir,
+        issueTitle: `video-edit/${requestId}`,
+      });
+      expect(env.UGC_INPUT_DIR).toBe(dir);
+      expect(env.UGC_INPUT_COUNT).toBe("2");
+    });
+
+    it("does NOT emit UGC_INPUT_DIR for a non-video issue title even if a same-named dir exists", () => {
+      // The dir exists but the issue is not a video-* one, so the
+      // dispatcher short-circuits before the UGC check runs. This also
+      // matches the existing video-only VIDEO_AD_* gating.
+      const dir = path.join(tmpRoot, "req-non-video");
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, "hook.mp4"), "");
+      const env = buildGuildWorkerEnv({
+        agent: engGuildAgent,
+        sandboxDir,
+        issueTitle: "eng-typescript-bug",
+      });
+      expect(env.UGC_INPUT_DIR).toBeUndefined();
+      expect(env.UGC_INPUT_COUNT).toBeUndefined();
+      // Existing behavior preserved: no video env vars either.
+      expect(env.VIDEO_AD_STAGE).toBeUndefined();
+      expect(env.VIDEO_AD_REQUEST_ID).toBeUndefined();
+    });
+
+    it("emits UGC_INPUT_DIR for every recognised video stage when clips are present", () => {
+      for (const stage of ["research", "strategy", "copy", "edit"]) {
+        const requestId = `req-${stage}`;
+        const dir = path.join(tmpRoot, requestId);
+        fs.mkdirSync(dir);
+        fs.writeFileSync(path.join(dir, "clip.mp4"), "");
+        const env = buildGuildWorkerEnv({
+          agent: guildAgent,
+          sandboxDir,
+          issueTitle: `video-${stage}/${requestId}`,
+        });
+        expect(env.UGC_INPUT_DIR).toBe(dir);
+        expect(env.UGC_INPUT_COUNT).toBe("1");
+      }
+    });
+
+    it("uses the production default root (/paperclip/operator-uploads) when PAPERCLIP_OPERATOR_UPLOADS_ROOT is unset", () => {
+      // The default root almost certainly does not exist on the test
+      // host, so the helper must short-circuit cleanly with no emission
+      // and no error.
+      vi.stubEnv("PAPERCLIP_OPERATOR_UPLOADS_ROOT", undefined as unknown as string);
+      const env = buildGuildWorkerEnv({
+        agent: guildAgent,
+        sandboxDir,
+        issueTitle: "video-edit/req-no-default-root",
+      });
+      expect(env.UGC_INPUT_DIR).toBeUndefined();
+      expect(env.UGC_INPUT_COUNT).toBeUndefined();
     });
   });
 });
