@@ -78,6 +78,10 @@ import {
 } from "../dispatch/artifacts-client.js";
 import { uploadWorkerArtifacts } from "../dispatch/upload-worker-artifacts.js";
 import { VIDEO_ISSUE_TITLE_PATTERN } from "../dispatch/guild-worker-env.js";
+import {
+  resolveVideoEditDirectTarget,
+  runVideoEditSubstageDirectly,
+} from "../dispatch/video-edit-direct.js";
 import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
@@ -6914,7 +6918,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (videoTitleMatch && args.runStatus === "succeeded") {
         const uploadStage = videoTitleMatch[1];
         const uploadRequestId = videoTitleMatch[2];
-        if (uploadStage === "edit") {
+        // Plan 5 splits the monolithic `edit` issue into 10 sub-stages
+        // (edit-scene-1..5, edit-stitch, edit-motion-graphics,
+        // edit-screenshots, edit-captions, edit-final). The brief.json
+        // is mirrored into the edit-final worker's artifacts/out/ by
+        // finalize.py:_copy_bundle_files. Legacy `edit` is still
+        // supported here for the monolithic path.
+        if (uploadStage === "edit" || uploadStage === "edit-final") {
           const briefPath = path.join(
             args.guildSandboxDir,
             "artifacts",
@@ -7020,15 +7030,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               "video-guild artifact upload: failed to write activity_log(video.artifacts.uploaded)",
             );
           }
-          // Bug H fix: emit video.ad.final_cut_ready when the edit
-          // stage completes AND both final.mp4 and brief.json
-          // uploaded. The ceo-chat notifier polls this row and
-          // dispatches the 5-file Telegram bundle. Before this,
-          // the operator had to manually INSERT the row each time.
+          // Bug H fix + Plan 5 A4 + Plan 5 Fix 3: emit
+          // video.ad.final_cut_ready when the edit (monolithic) or
+          // edit-final (Plan 5 sub-stage) worker uploads final.mp4.
+          // brief.json is NO LONGER required to fire the emit (Fix 3):
+          // final.mp4 is the irreducible delivery artifact and the
+          // operator should still receive it even when bundle assembly
+          // partially fails. brief_path drops to the same conditional
+          // emit treatment as the caption fields below.
           if (
-            uploadStage === "edit" &&
-            videoArtifactsUploaded.uploaded.includes("final.mp4") &&
-            videoArtifactsUploaded.uploaded.includes("brief.json")
+            (uploadStage === "edit" || uploadStage === "edit-final") &&
+            videoArtifactsUploaded.uploaded.includes("final.mp4")
           ) {
             try {
               await logActivity(db, {
@@ -7042,22 +7054,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 runId: args.run.id,
                 details: {
                   request_id: uploadRequestId,
-                  // mp4_path + brief_path are unconditional: the
-                  // outer gate already requires both in uploaded[].
-                  mp4_path: `agent-fs:/${uploadRequestId}/edit/final.mp4`,
-                  brief_path: `agent-fs:/${uploadRequestId}/edit/brief.json`,
+                  // mp4_path is unconditional: the outer gate requires
+                  // final.mp4 in uploaded[]. All other bundle files
+                  // (brief + caption family) emit conditionally so the
+                  // ceo-chat dispatcher does not enumerate paths that
+                  // 404 on fetch (avoids alarm noise + saves tmpdir
+                  // churn on the notifier side).
+                  mp4_path: `agent-fs:/${uploadRequestId}/${uploadStage}/final.mp4`,
+                  ...(videoArtifactsUploaded.uploaded.includes("brief.json")
+                    ? { brief_path: `agent-fs:/${uploadRequestId}/${uploadStage}/brief.json` }
+                    : {}),
                   // Optional caption files: emit ONLY when they
                   // actually landed in agent-fs so the operator's
                   // Telegram caption does not list paths to files
                   // that 404'd on dispatch.
                   ...(videoArtifactsUploaded.uploaded.includes("captions.srt")
-                    ? { srt_path: `agent-fs:/${uploadRequestId}/edit/captions.srt` }
+                    ? { srt_path: `agent-fs:/${uploadRequestId}/${uploadStage}/captions.srt` }
                     : {}),
                   ...(videoArtifactsUploaded.uploaded.includes("caption_variants.json")
-                    ? { caption_variants_path: `agent-fs:/${uploadRequestId}/edit/caption_variants.json` }
+                    ? { caption_variants_path: `agent-fs:/${uploadRequestId}/${uploadStage}/caption_variants.json` }
                     : {}),
                   ...(videoArtifactsUploaded.uploaded.includes("caption_text.txt")
-                    ? { caption_text_path: `agent-fs:/${uploadRequestId}/edit/caption_text.txt` }
+                    ? { caption_text_path: `agent-fs:/${uploadRequestId}/${uploadStage}/caption_text.txt` }
                     : {}),
                   ...(editStageBrief?.rubric_pass
                     ? { rubric_pass: editStageBrief.rubric_pass }
@@ -8373,31 +8391,73 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         : { ...runtimeConfig, ...issueContextConfigLayer };
 
-      let adapterResult = await adapter.execute({
-        runId: run.id,
-        agent: wrappedAgent,
-        runtime: runtimeForAdapter,
-        config: runtimeConfigForAdapter,
-        context,
-        runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
-        executionTarget,
-        executionTransport: remoteExecution
-          ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
-          : undefined,
-        onLog,
-        onMeta: onAdapterMeta,
-        onSpawn: async (meta) => {
-          await persistRunProcessMetadata(run.id, {
-            pid: meta.pid,
-            processGroupId:
-              "processGroupId" in meta && typeof meta.processGroupId === "number"
-                ? meta.processGroupId
-                : null,
-            startedAt: meta.startedAt,
-          });
-        },
-        authToken: authToken ?? undefined,
-      });
+      // Plan 5 Phase B -- direct-Python wedge for video-edit-* sub-stages.
+      // The LLM-adapter path is bypassed entirely when the issueTitle
+      // names a Plan 5 edit sub-stage (edit-scene-N / edit-stitch /
+      // edit-motion-graphics / edit-screenshots / edit-captions /
+      // edit-final). These are deterministic Python scripts with no
+      // creative latitude; running an LLM on them was pure overhead +
+      // a hallucination liability (B1 in SMOKE-RETRO-2026-05-28).
+      // The post-execution flow below (artifact upload, final_cut_ready
+      // emit, escalation backstop) is unchanged; the wedge synthesizes
+      // an AdapterExecutionResult-compatible value with exitCode=0 on
+      // clean exit so `args.runStatus === "succeeded"` derivation works.
+      // Non-edit-* stages (research / strategy / copy) are CREATIVE and
+      // stay on the LLM-adapter path -- resolveVideoEditDirectTarget
+      // returns null for them and the else-branch runs as before.
+      const directVideoEditTarget = guildSandboxDir
+        ? resolveVideoEditDirectTarget(issueContext?.title ?? null)
+        : null;
+      let adapterResult;
+      if (directVideoEditTarget) {
+        adapterResult = await runVideoEditSubstageDirectly({
+          target: directVideoEditTarget,
+          cwd: guildSandboxDir!,
+          // process.env first so container-level secrets (AGENT_FS_URL,
+          // AGENT_FS_TOKEN, FAL_KEY, ELEVENLABS_API_KEY loaded from
+          // /root/.env.shared) are visible; guildEnv on top so per-run
+          // scoped vars (AGENT_HOME, VIDEO_AD_STAGE, VIDEO_AD_REQUEST_ID)
+          // override any container defaults.
+          env: { ...(process.env as Record<string, string>), ...guildEnv },
+          callbacks: {
+            onLog,
+            onSpawn: async (meta) => {
+              await persistRunProcessMetadata(run.id, {
+                pid: meta.pid,
+                processGroupId: meta.processGroupId,
+                startedAt: meta.startedAt,
+              });
+            },
+          },
+          logger,
+        });
+      } else {
+        adapterResult = await adapter.execute({
+          runId: run.id,
+          agent: wrappedAgent,
+          runtime: runtimeForAdapter,
+          config: runtimeConfigForAdapter,
+          context,
+          runtimeCommandSpec: adapter.getRuntimeCommandSpec?.(runtimeConfig) ?? null,
+          executionTarget,
+          executionTransport: remoteExecution
+            ? { remoteExecution: remoteExecution as unknown as Record<string, unknown> }
+            : undefined,
+          onLog,
+          onMeta: onAdapterMeta,
+          onSpawn: async (meta) => {
+            await persistRunProcessMetadata(run.id, {
+              pid: meta.pid,
+              processGroupId:
+                "processGroupId" in meta && typeof meta.processGroupId === "number"
+                  ? meta.processGroupId
+                  : null,
+              startedAt: meta.startedAt,
+            });
+          },
+          authToken: authToken ?? undefined,
+        });
+      }
 
       // Phase E2: escalation backstop. If the first call failed AND we
       // resolved a non-heavy tier, retry once with the next tier up.
@@ -8422,10 +8482,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const adapterOwnsRetry =
         Boolean(adapterResult.errorFamily) || Boolean(adapterResult.retryNotBefore);
       const escalateCandidate = resolvedRoutingTier ? escalateOneTier(resolvedRoutingTier) : null;
+      // Plan 5 Phase B: NEVER escalate a direct-Python wedge failure to
+      // a heavier LLM tier. The escalation backstop spawns adapter.execute
+      // (the LLM path) on its retry attempt; re-introducing an LLM into
+      // a deterministic script's failure path resurrects the exact B1
+      // hallucination class Phase B was meant to kill. A failed Python
+      // substage means the script is broken or the env is broken --
+      // both demand operator intervention, not LLM re-attempt.
+      const isDirectPythonResult = adapterResult.provider === "python-direct";
       if (
         firstCallFailed &&
         !adapterResult.timedOut &&
         !adapterOwnsRetry &&
+        !isDirectPythonResult &&
         escalationCount === 0 &&
         escalateCandidate !== null &&
         resolvedRoutingTier !== null &&
