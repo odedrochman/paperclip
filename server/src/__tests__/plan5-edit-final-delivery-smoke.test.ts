@@ -573,4 +573,328 @@ describe("Plan 5 end-to-end smoke: edit-final delivery", () => {
       expect(call.bodyBytes.toString()).not.toContain("SECRET");
     }
   });
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Full-pipeline simulation: walks every Plan 5 stage in order, exercising
+  // the upload contract at each substage and the chain dependency between
+  // them (stitch reads scene mp4s, motion-graphics reads stitched, etc).
+  //
+  // What this catches that the single-stage smoke doesn't:
+  //   - Wrong namespace for ANY intermediate substage (not just edit-final)
+  //   - Chain dependency mismatch: stitch.py's expected fetch path must
+  //     match where edit-scene-N actually uploaded.
+  //   - render-log.json (per-substage provenance) doesn't accidentally
+  //     leak into the operator's 5-file bundle.
+  //   - The Plan 5 default + per-file path resolution stays consistent
+  //     across all substage uploads from a single full run.
+  // ─────────────────────────────────────────────────────────────────────────
+  it("FULL pipeline: research -> strategy -> copy -> 10 edit substages -> emit -> Telegram", async () => {
+    const requestId = "smoke-full-pipeline-1";
+
+    // ── Stages 1-3: creative LLM stages (research, strategy, copy) ────────
+    // These stay on the LLM-adapter path (not Phase B). Their outputs are
+    // what downstream edit substages depend on, so we pre-seed agent-fs
+    // with the exact uploads those workers would produce.
+    const researchBundle = { topic: "smoke ad topic", angles: ["angle-a"] };
+    const creativeBrief = { brief: "smoke creative brief", tone: "punchy" };
+    const script = {
+      scenes: [
+        { scene: 1, voText: "scene 1 vo", displayText: "Scene 1", durationS: 5 },
+        { scene: 2, voText: "scene 2 vo", displayText: "Scene 2", durationS: 5 },
+        { scene: 3, voText: "scene 3 vo", displayText: "Scene 3", durationS: 5 },
+        { scene: 4, voText: "scene 4 vo", displayText: "Scene 4", durationS: 5 },
+        { scene: 5, voText: "scene 5 vo", displayText: "Scene 5", durationS: 5 },
+      ],
+    };
+    const captionsSrt =
+      "1\n00:00:00,500 --> 00:00:04,700\nFull-pipeline smoke caption.\n";
+    const captionVariants = { variants: ["smoke v1", "smoke v2"] };
+    const captionText = "Full-pipeline smoke caption.\n";
+    const briefJson = {
+      rubric_pass: { item_1: true, item_2: true, item_3: false },
+      ai_disclosure_required: true,
+    };
+
+    agentFs.put(requestId, "research", "research-bundle.json", Buffer.from(JSON.stringify(researchBundle)));
+    agentFs.put(requestId, "strategy", "creative-brief.json", Buffer.from(JSON.stringify(creativeBrief)));
+    agentFs.put(requestId, "copy", "script.json", Buffer.from(JSON.stringify(script)));
+    agentFs.put(requestId, "copy", "captions.srt", Buffer.from(captionsSrt));
+    agentFs.put(requestId, "copy", "caption_variants.json", Buffer.from(JSON.stringify(captionVariants)));
+    agentFs.put(requestId, "copy", "caption_text.txt", Buffer.from(captionText));
+    agentFs.put(requestId, "copy", "brief.json", Buffer.from(JSON.stringify(briefJson)));
+
+    const uploadClient = httpArtifactUploadClient({ url: agentFs.baseUrl, token });
+
+    // Helper: run a single substage's upload contract by writing the
+    // worker's outputs to a fresh sandbox, calling the REAL
+    // uploadWorkerArtifacts, and returning the result for assertions.
+    async function runSubstage(args: {
+      stage: string;
+      outputs: Record<string, Buffer>;
+    }): Promise<{ uploaded: string[]; failed: Array<{ filename: string; reason: string }> }> {
+      const substageSandbox = await fsp.mkdtemp(
+        path.join(os.tmpdir(), `plan5-pipeline-${args.stage}-`),
+      );
+      const subOutDir = path.join(substageSandbox, "artifacts", "out");
+      await fsp.mkdir(subOutDir, { recursive: true });
+      for (const [name, body] of Object.entries(args.outputs)) {
+        await fsp.writeFile(path.join(subOutDir, name), body);
+      }
+      const result = await uploadWorkerArtifacts({
+        agentHomeDir: substageSandbox,
+        requestId,
+        stage: args.stage,
+        uploadClient,
+        logger: noopLogger,
+      });
+      // Cleanup substage sandbox.
+      await fsp.rm(substageSandbox, { recursive: true, force: true }).catch(() => {});
+      return result;
+    }
+
+    // ── Stages 4-8: edit-scene-1 .. edit-scene-5 ──────────────────────────
+    const sceneBytes: Record<number, Buffer> = {};
+    for (let n = 1; n <= 5; n++) {
+      // Distinct per-scene payload so any cross-wiring shows up as a
+      // mismatched assertion later.
+      const body = Buffer.from(`scene-${n}-mp4-payload-unique`, "utf-8");
+      sceneBytes[n] = body;
+      const renderLog = { scene: n, model: "kling-2.1-pro-stub", elapsed_s: 0.1 };
+
+      const res = await runSubstage({
+        stage: `edit-scene-${n}`,
+        outputs: {
+          [`scene-${n}.mp4`]: body,
+          "render-log.json": Buffer.from(JSON.stringify(renderLog)),
+        },
+      });
+      expect(res.failed).toEqual([]);
+      expect(res.uploaded.sort()).toEqual([`scene-${n}.mp4`, "render-log.json"].sort());
+      expect(agentFs.has(requestId, `edit-scene-${n}`, `scene-${n}.mp4`)).toBe(true);
+    }
+
+    // ── CHAIN DEPENDENCY CHECK: edit-stitch reads each scene from
+    //    agent-fs at /<id>/edit-scene-N/scene-N.mp4. Verify each is
+    //    fetchable + byte-equal to what we uploaded.
+    const fetcherProbe = ceoChatFetcher.httpArtifactFetcher({
+      url: agentFs.baseUrl,
+      token,
+    });
+    for (let n = 1; n <= 5; n++) {
+      const tmp = path.join(os.tmpdir(), `pipeline-probe-scene-${n}-${Date.now()}.bin`);
+      await fetcherProbe.fetchArtifactToFile(requestId, `edit-scene-${n}`, `scene-${n}.mp4`, tmp);
+      const fetched = readFileSync(tmp);
+      expect(fetched.equals(sceneBytes[n]!)).toBe(true);
+      await fsp.rm(tmp, { force: true });
+    }
+
+    // ── Stage 9: edit-stitch ──────────────────────────────────────────────
+    const stitchedBytes = Buffer.from("stitched-mp4-from-5-scenes", "utf-8");
+    {
+      const res = await runSubstage({
+        stage: "edit-stitch",
+        outputs: {
+          "stitched.mp4": stitchedBytes,
+          "render-log.json": Buffer.from(JSON.stringify({ scenes: 5 })),
+        },
+      });
+      expect(res.failed).toEqual([]);
+      expect(agentFs.has(requestId, "edit-stitch", "stitched.mp4")).toBe(true);
+      // CRITICAL: must NOT have leaked into legacy /edit/ namespace.
+      expect(agentFs.has(requestId, "edit", "stitched.mp4")).toBe(false);
+    }
+
+    // CHAIN: motion-graphics fetches stitched.mp4 from /<id>/edit-stitch/.
+    {
+      const tmp = path.join(os.tmpdir(), `pipeline-probe-stitched-${Date.now()}.bin`);
+      await fetcherProbe.fetchArtifactToFile(requestId, "edit-stitch", "stitched.mp4", tmp);
+      expect(readFileSync(tmp).equals(stitchedBytes)).toBe(true);
+      await fsp.rm(tmp, { force: true });
+    }
+
+    // ── Stage 10: edit-motion-graphics ────────────────────────────────────
+    const motionGraphicsBytes = Buffer.from("motion-graphics-mp4-overlaid-cards", "utf-8");
+    {
+      const res = await runSubstage({
+        stage: "edit-motion-graphics",
+        outputs: {
+          "motion-graphics.mp4": motionGraphicsBytes,
+          "render-log.json": Buffer.from(JSON.stringify({ cards: 3 })),
+        },
+      });
+      expect(res.failed).toEqual([]);
+      expect(agentFs.has(requestId, "edit-motion-graphics", "motion-graphics.mp4")).toBe(true);
+    }
+
+    // ── Stage 11: edit-screenshots ────────────────────────────────────────
+    const balancedBytes = Buffer.from("balanced-mp4-with-operator-screenshots", "utf-8");
+    {
+      const res = await runSubstage({
+        stage: "edit-screenshots",
+        outputs: {
+          "balanced.mp4": balancedBytes,
+          "render-log.json": Buffer.from(JSON.stringify({ screenshots: 0 })),
+        },
+      });
+      expect(res.failed).toEqual([]);
+      expect(agentFs.has(requestId, "edit-screenshots", "balanced.mp4")).toBe(true);
+    }
+
+    // ── Stage 12: edit-captions ───────────────────────────────────────────
+    // Real captions.py reads balanced.mp4 from /<id>/edit-screenshots/
+    // AND captions.srt from /<id>/copy/ (via get_text fallback when the
+    // dispatcher mirror is missing). Both paths already work in agent-fs.
+    const captionedBytes = Buffer.from("captioned-mp4-with-burnt-in-caps", "utf-8");
+    {
+      const res = await runSubstage({
+        stage: "edit-captions",
+        outputs: {
+          "captioned.mp4": captionedBytes,
+          "render-log.json": Buffer.from(JSON.stringify({ cues: 5 })),
+        },
+      });
+      expect(res.failed).toEqual([]);
+      expect(agentFs.has(requestId, "edit-captions", "captioned.mp4")).toBe(true);
+    }
+
+    // CHAIN: edit-final fetches the most-processed cut (captioned.mp4
+    // from /<id>/edit-captions/) via finalize.py's _CUT_STAGE map.
+    {
+      const tmp = path.join(os.tmpdir(), `pipeline-probe-captioned-${Date.now()}.bin`);
+      await fetcherProbe.fetchArtifactToFile(requestId, "edit-captions", "captioned.mp4", tmp);
+      expect(readFileSync(tmp).equals(captionedBytes)).toBe(true);
+      await fsp.rm(tmp, { force: true });
+    }
+
+    // ── Stage 13: edit-final ──────────────────────────────────────────────
+    // What finalize.py would produce in its artifacts/out/ after a real
+    // run: final.mp4 (ffmpeg-remuxed from captioned.mp4) + the 4 bundle
+    // files mirrored from /<id>/copy/ via the agent-fs fallback Fix 1
+    // added + a render-log.json. The upload hook then pushes ALL of
+    // these to /<id>/edit-final/.
+    const finalMp4Bytes = Buffer.from("final-mp4-faststart-remux-of-captioned", "utf-8");
+    {
+      const res = await runSubstage({
+        stage: "edit-final",
+        outputs: {
+          "final.mp4": finalMp4Bytes,
+          "captions.srt": Buffer.from(captionsSrt),
+          "caption_text.txt": Buffer.from(captionText),
+          "caption_variants.json": Buffer.from(JSON.stringify(captionVariants)),
+          "brief.json": Buffer.from(JSON.stringify(briefJson)),
+          "render-log.json": Buffer.from(JSON.stringify({ source_cut: "captioned.mp4" })),
+        },
+      });
+      expect(res.failed).toEqual([]);
+      // All 5 bundle files + render-log landed at /edit-final/.
+      for (const name of [
+        "final.mp4",
+        "captions.srt",
+        "caption_text.txt",
+        "caption_variants.json",
+        "brief.json",
+        "render-log.json",
+      ]) {
+        expect(agentFs.has(requestId, "edit-final", name), `missing /edit-final/${name}`).toBe(true);
+      }
+    }
+
+    // ── Heartbeat emit: synthesise the exact row the upload hook fires.
+    const emit = buildHeartbeatEmit({
+      requestId,
+      uploadStage: "edit-final",
+      uploaded: [
+        "final.mp4",
+        "captions.srt",
+        "caption_text.txt",
+        "caption_variants.json",
+        "brief.json",
+      ],
+    });
+
+    // ── ceo-chat dispatch: REAL dispatcher, REAL fetcher, REAL agent-fs.
+    const fetcher = ceoChatFetcher.httpArtifactFetcher({ url: agentFs.baseUrl, token });
+    const { sender, calls } = makeRecordingSender();
+    const logLines: string[] = [];
+
+    await ceoChatNotifier.dispatchVideoFinalCut({
+      chatId: 99999,
+      bundle: emit as unknown as Parameters<
+        typeof ceoChatNotifier.dispatchVideoFinalCut
+      >[0]["bundle"],
+      telegram: sender,
+      log: (msg) => {
+        logLines.push(msg);
+      },
+      fetcher,
+    });
+
+    // ── End-to-end assertions ─────────────────────────────────────────────
+
+    // 1 video + 4 docs, all delivered.
+    expect(calls.length).toBe(5);
+    expect(calls.filter((c) => c.kind === "video").length).toBe(1);
+    expect(calls.filter((c) => c.kind === "doc").length).toBe(4);
+
+    // Byte equality on the mp4: the byte-stream from edit-captions ->
+    // (simulated) finalize.py -> edit-final upload -> ceo-chat fetch ->
+    // Telegram is identical to what we said the finalize remux produced.
+    const videoCall = calls.find((c) => c.kind === "video")!;
+    expect(videoCall.bodyBytes.equals(finalMp4Bytes)).toBe(true);
+    expect(videoCall.chatId).toBe(99999);
+
+    // captions.srt round-trips byte-equal.
+    const srtCall = calls.find((c) => c.filename === "captions.srt")!;
+    expect(srtCall.bodyBytes.toString("utf-8")).toBe(captionsSrt);
+
+    // brief.json delivered with the rubric the worker wrote.
+    const briefCall = calls.find((c) => c.filename === "brief.json")!;
+    expect(JSON.parse(briefCall.bodyBytes.toString("utf-8"))).toEqual(briefJson);
+
+    // 5/5 delivery summary in the log.
+    expect(
+      logLines.some((m) => m.includes("delivered") && m.includes("5 of 5")),
+      `expected 5/5 summary, got: ${JSON.stringify(logLines)}`,
+    ).toBe(true);
+
+    // render-log.json was uploaded per-substage but is NOT in the
+    // dispatcher's hardcoded bundle list -- assert it never made it
+    // to Telegram (operator gets the 5-file delivery, not stage
+    // provenance noise).
+    for (const c of calls) {
+      expect(c.filename).not.toBe("render-log.json");
+    }
+
+    // EVERY substage upload landed at the per-substage namespace,
+    // NEVER at the legacy /edit/ flat namespace. This rules out any
+    // regression to the pre-Plan-5 path assumption.
+    const editSubstageUploads = agentFs.putRequestPaths.filter((p) =>
+      p.includes(`/${requestId}/edit-`),
+    );
+    const legacyEditUploads = agentFs.putRequestPaths.filter((p) =>
+      p.match(new RegExp(`/${requestId}/edit/`)),
+    );
+    expect(editSubstageUploads.length).toBeGreaterThan(0);
+    expect(legacyEditUploads.length).toBe(0);
+
+    // EVERY dispatcher fetch hit /<id>/edit-final/ -- confirms the
+    // bundleStage resolution stayed at Plan 5 for the full bundle.
+    for (const reqPath of agentFs.getRequestPaths.filter((p) => p.includes(requestId))) {
+      // probe fetches at scene/stitch/captions namespaces are OK (they
+      // were our chain-dependency assertions, not dispatcher); the
+      // dispatcher's 5 fetches all hit /edit-final/.
+      const isDispatcherFetch =
+        reqPath.includes("/final.mp4/binary") ||
+        reqPath.includes("/captions.srt/binary") ||
+        reqPath.includes("/caption_variants.json/binary") ||
+        reqPath.includes("/caption_text.txt/binary") ||
+        reqPath.includes("/brief.json/binary");
+      if (isDispatcherFetch) {
+        expect(
+          reqPath.includes("/edit-final/"),
+          `dispatcher fetch landed at wrong stage: ${reqPath}`,
+        ).toBe(true);
+      }
+    }
+  });
 });
