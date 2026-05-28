@@ -394,4 +394,109 @@ describe("video-guild worker env", () => {
       expect(env.UGC_INPUT_COUNT).toBeUndefined();
     });
   });
+
+  /**
+   * Plan 5 -- edit sub-stage gates. The orchestrator dispatches
+   * separate paperclip issues for each gate inside the edit stage so
+   * the operator can approve per-scene + per-post-render step. Issue
+   * titles take the form `video-edit-<sub>/<request_id>`. The
+   * dispatcher must extract the sub-stage as VIDEO_AD_STAGE so the
+   * worker knows which sub-stage to run.
+   */
+  describe("Plan 5 edit sub-stage gates", () => {
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    const SUB_STAGES = [
+      "edit-scene-1",
+      "edit-scene-2",
+      "edit-scene-3",
+      "edit-scene-4",
+      "edit-scene-5",
+      "edit-stitch",
+      "edit-motion-graphics",
+      "edit-screenshots",
+      "edit-captions",
+      "edit-final",
+    ] as const;
+
+    for (const sub of SUB_STAGES) {
+      it(`extracts VIDEO_AD_STAGE='${sub}' from video-${sub}/<id>`, () => {
+        const env = buildGuildWorkerEnv({
+          agent: guildAgent,
+          sandboxDir,
+          issueTitle: `video-${sub}/req-plan5`,
+        });
+        expect(env.VIDEO_AD_STAGE).toBe(sub);
+        expect(env.VIDEO_AD_REQUEST_ID).toBe("req-plan5");
+      });
+    }
+
+    it("matches edit-scene-1 not 'edit' when title is video-edit-scene-1/<id> (alternation order)", () => {
+      // Regression guard: if the regex's alternation put 'edit' before
+      // 'edit-scene-1', the regex would greedily match 'edit' and
+      // capture '/scene-1/req-x' as the request_id (which has a slash,
+      // failing the [^/]+ guard). The order in the live regex must
+      // therefore put longer prefixes first.
+      const env = buildGuildWorkerEnv({
+        agent: guildAgent,
+        sandboxDir,
+        issueTitle: "video-edit-scene-1/req-disambig",
+      });
+      expect(env.VIDEO_AD_STAGE).toBe("edit-scene-1");
+      expect(env.VIDEO_AD_REQUEST_ID).toBe("req-disambig");
+    });
+
+    it("rejects unknown sub-stage names (e.g. video-edit-scene-9)", () => {
+      const env = buildGuildWorkerEnv({
+        agent: guildAgent,
+        sandboxDir,
+        issueTitle: "video-edit-scene-9/req-bogus",
+      });
+      expect(env.VIDEO_AD_STAGE).toBeUndefined();
+      expect(env.VIDEO_AD_REQUEST_ID).toBeUndefined();
+    });
+
+    it("rejects unknown sub-stage names (e.g. video-edit-foo)", () => {
+      const env = buildGuildWorkerEnv({
+        agent: guildAgent,
+        sandboxDir,
+        issueTitle: "video-edit-foo/req-bogus",
+      });
+      expect(env.VIDEO_AD_STAGE).toBeUndefined();
+      expect(env.VIDEO_AD_REQUEST_ID).toBeUndefined();
+    });
+
+    it("forwards FAL_KEY to sub-stage workers (Plan 5 allowlist extension)", () => {
+      vi.stubEnv("FAL_KEY", "test-uuid:test-secret");
+      const env = buildGuildWorkerEnv({
+        agent: guildAgent,
+        sandboxDir,
+        issueTitle: "video-edit-scene-1/req-fal-test",
+      });
+      expect(env.FAL_KEY).toBe("test-uuid:test-secret");
+    });
+
+    it("does NOT forward FAL_KEY for non-video guild issues", () => {
+      vi.stubEnv("FAL_KEY", "test-uuid:test-secret");
+      const env = buildGuildWorkerEnv({
+        agent: engGuildAgent,
+        sandboxDir,
+        issueTitle: "eng-typescript-bug",
+      });
+      expect(env.FAL_KEY).toBeUndefined();
+    });
+
+    it("sets VIDEO_AD_ARTIFACTS_DIR for every sub-stage", () => {
+      for (const sub of SUB_STAGES) {
+        const env = buildGuildWorkerEnv({
+          agent: guildAgent,
+          sandboxDir,
+          issueTitle: `video-${sub}/req-art-${sub}`,
+        });
+        expect(env.VIDEO_AD_ARTIFACTS_DIR).toBe(path.join(sandboxDir, "artifacts"));
+      }
+    });
+  });
 });

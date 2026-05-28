@@ -76,9 +76,15 @@ const REQUEST_ID_SAFE_PATTERN = /^[a-zA-Z0-9_.\-]+$/;
  *
  * Add a new key here when a new third-party dep lands. No other
  * code change should be needed.
+ *
+ * Plan 5 (2026-05-27) added FAL_KEY for the fal.ai-based Kling
+ * pipeline (image-to-video + Sync Labs lipsync). Format is
+ * `<uuid>:<hex_secret>`; the fal_client Python SDK auto-reads it.
+ * See [[fal_ai_gotchas]].
  */
 export const VIDEO_WORKER_FORWARDED_ENV_KEYS = [
   "ELEVENLABS_API_KEY",
+  "FAL_KEY",
 ] as const;
 
 /** memory-service project namespace prefix for per-guild observations.
@@ -86,21 +92,37 @@ export const VIDEO_WORKER_FORWARDED_ENV_KEYS = [
 export const GUILD_MEMORY_PROJECT_PREFIX = "farm";
 
 /**
- * Phase 2 Task 2.1 -- video-guild dispatcher env-var pass-through.
+ * video-guild dispatcher env-var pass-through.
  *
  * Issue titles of the form `video-<stage>/<request_id>` are emitted by
- * the video-ad orchestrator for each pipeline stage. When the
+ * the video-ad orchestrator for each pipeline gate. When the
  * dispatcher spawns a worker for one of these issues we surface the
- * parent request id + stage as env vars so worker-side tools can scope
+ * parent request id + gate as env vars so worker-side tools can scope
  * their reads/writes to the right ad campaign.
  *
- * Stages are exact: research, strategy, copy, edit. Anything else (e.g.
- * `video-foo/...`) is ignored so a typo never silently activates the
- * video-ad code path. The request_id segment must not contain a slash,
- * so titles like `video-research/campaign-42/v2` fail to match cleanly
- * rather than silently swallowing the extra path segment.
+ * Top-level stages (legacy v1): research, strategy, copy, edit.
+ *
+ * Plan 5 edit sub-stage gates (per-scene + post-render gates):
+ *   edit-scene-1 .. edit-scene-5  (per-scene Kling+Sync render)
+ *   edit-stitch                    (concatenate scenes)
+ *   edit-motion-graphics           (Pillow card overlays)
+ *   edit-screenshots               (operator-screenshot integration)
+ *   edit-captions                  (caption burn)
+ *   edit-final                     (final pass + delivery bundle)
+ *
+ * Anything else (e.g. `video-foo/...`) is ignored so a typo never
+ * silently activates the video-ad code path.
+ *
+ * The request_id segment must not contain a slash, so titles like
+ * `video-research/campaign-42/v2` fail to match cleanly rather than
+ * silently swallowing the extra path segment.
+ *
+ * Alternation order: more-specific (longer-prefix) variants come
+ * FIRST so `video-edit-scene-1/<id>` matches as `edit-scene-1`, not
+ * as `edit` with the rest being captured as a malformed request_id.
  */
-export const VIDEO_ISSUE_TITLE_PATTERN = /^video-(research|strategy|copy|edit)\/([^/]+)$/;
+export const VIDEO_ISSUE_TITLE_PATTERN =
+  /^video-(edit-scene-[1-5]|edit-stitch|edit-motion-graphics|edit-screenshots|edit-captions|edit-final|research|strategy|copy|edit)\/([^/]+)$/;
 
 export interface BuildGuildWorkerEnvInput {
   agent: Pick<AgentRow, "id" | "name" | "kind">;

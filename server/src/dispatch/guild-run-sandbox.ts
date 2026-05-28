@@ -43,28 +43,69 @@ import {
 } from "./guild-worker-env.js";
 
 /**
- * Phase 2 Task 2.4 -- video-guild stage pipeline contract.
+ * video-guild stage pipeline contract.
  *
- * Ordered list of pipeline stages. For a worker spawning in stage S,
- * the dispatcher mirrors every artifact produced by stages strictly
- * before S, in this order. `edit` is the terminal stage, so nothing
- * downstream ever reads its outputs from a sandbox.
+ * Ordered list of pipeline stages + edit sub-stages (Plan 5). For a
+ * worker spawning in stage S, the dispatcher mirrors every artifact
+ * produced by stages strictly before S, in this order. `edit-final`
+ * is the terminal gate, so nothing downstream ever reads its outputs
+ * from a sandbox.
+ *
+ * Plan 5 (2026-05-27) extended the original 4-stage list with the
+ * edit-* sub-gates. Top-level `edit` remains in the tuple for legacy
+ * back-compat (ads that do NOT declare editSubStages still walk
+ * research → strategy → copy → edit). When editSubStages are declared
+ * the orchestrator skips top-level `edit` entirely and dispatches the
+ * sub-gates instead.
+ *
+ * Order matters: the prior-stage mirror walks this tuple in order, so
+ * a later element's worker will see every earlier element's outputs
+ * mirrored into its sandbox.
  */
-const VIDEO_STAGES = ["research", "strategy", "copy", "edit"] as const;
+const VIDEO_STAGES = [
+  "research",
+  "strategy",
+  "copy",
+  "edit",
+  "edit-scene-1",
+  "edit-scene-2",
+  "edit-scene-3",
+  "edit-scene-4",
+  "edit-scene-5",
+  "edit-stitch",
+  "edit-motion-graphics",
+  "edit-screenshots",
+  "edit-captions",
+  "edit-final",
+] as const;
 export type VideoStage = (typeof VIDEO_STAGES)[number];
 
 /**
  * Per-stage artifact contract -- the JSON files each stage publishes
- * for downstream stages to consume. v0 is JSON-only because the
- * agent-fs Task 2.3 route returns only JSON; text/binary artifacts
- * (captions.srt, render.mp4, etc.) are deferred to a future agent-fs
- * route extension. Phase 6 smoke will reveal whether v0 is sufficient.
+ * for downstream stages to consume via the JSON-mirror walk in
+ * `prepareGuildRunSandbox`. The mirror is JSON-only by design (matches
+ * Task 2.3's agent-fs JSON route).
+ *
+ * Plan 5 edit sub-stages produce mp4 binary outputs, NOT JSON. They
+ * have empty arrays here so the mirror walk skips them. The sub-stage
+ * workers fetch the prior sub-stage's mp4 directly from agent-fs via
+ * the binary GET route at runtime (see Phase 2 worker code).
  */
 const VIDEO_STAGE_OUTPUTS: Record<VideoStage, readonly string[]> = {
   research: ["research-bundle.json"],
   strategy: ["creative-brief.json"],
   copy: ["script.json", "caption_variants.json"],
   edit: [],
+  "edit-scene-1": [],
+  "edit-scene-2": [],
+  "edit-scene-3": [],
+  "edit-scene-4": [],
+  "edit-scene-5": [],
+  "edit-stitch": [],
+  "edit-motion-graphics": [],
+  "edit-screenshots": [],
+  "edit-captions": [],
+  "edit-final": [],
 };
 
 /** Shape of a single canonical skill exposed to the worker at start of run.
