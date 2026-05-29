@@ -8904,6 +8904,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         } else if (outcome === "failed" && readTransientRecoveryContractFromRun(livenessRun)) {
           await scheduleBoundedRetryForRun(livenessRun, agent);
         }
+        // Plan 5 Phase B: a successful python-direct edit sub-stage has no
+        // LLM agent to self-report completion via a status tool call, so the
+        // issue would remain in_progress after the execution lock releases
+        // below and the dispatcher would immediately re-claim and re-render
+        // it -- an infinite, cost-burning loop (caught in the 2026-05-29
+        // smoke: edit-scene-1 succeeded exit 0, then re-dispatched in the
+        // same second). The creative LLM stages avoid this because the agent
+        // marks its own issue done. Mirror that here: mark the issue done
+        // BEFORE the lock releases so it parks awaiting the operator's
+        // per-sub-stage approval gate (which advances to the next sub-stage)
+        // instead of re-dispatching. Clean exit only; a failed/timed-out
+        // python run is intentionally left for operator intervention
+        // (escalation is skipped for python-direct, see above).
+        if (issueId && outcome === "succeeded" && isDirectPythonResult) {
+          try {
+            await issuesSvc.update(issueId, { status: "done" });
+          } catch (err) {
+            await onLog(
+              "stderr",
+              `[paperclip] Failed to mark python-direct issue done: ${err instanceof Error ? err.message : String(err)}\n`,
+            );
+          }
+        }
         const issueCommentPolicyResult = await finalizeIssueCommentPolicy(livenessRun, agent);
         await releaseIssueExecutionAndPromote(livenessRun);
         await handleRunLivenessContinuation(livenessRun);
